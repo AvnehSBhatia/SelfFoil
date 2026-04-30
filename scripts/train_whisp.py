@@ -20,18 +20,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.csv_tensor_cache import load_or_build_cache
+from core.device import configure_cuda_training, resolve_device
 from core.figures_path import figures_dir
 from core.whisp_net import WHISP
-
-
-def resolve_device(requested: str) -> torch.device:
-    if requested == "auto":
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        return torch.device("cpu")
-    return torch.device(requested)
 
 
 def move_bundle(bundle: dict, device: torch.device) -> dict:
@@ -112,7 +103,7 @@ def main() -> None:
     p.add_argument("--frac-train", type=float, default=0.8)
     p.add_argument("--frac-val", type=float, default=0.1)
     p.add_argument("--max-rows", type=int, default=None)
-    p.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
+    p.add_argument("--device", default="cuda", choices=["auto", "cpu", "mps", "cuda"])
     p.add_argument("--out", type=Path, default=ROOT / "models" / "whisp.pt")
     p.add_argument("--models-dir", type=Path, default=ROOT / "models", help="Directory with encoder_*.pt from train_autoencoders")
     p.add_argument("--enc-cl", type=Path, default=None)
@@ -122,6 +113,7 @@ def main() -> None:
     args = p.parse_args()
 
     device = resolve_device(args.device)
+    configure_cuda_training(device, deterministic=False)
     md = args.models_dir
     enc_cl = args.enc_cl or md / "encoder_cl_alpha.pt"
     enc_cd = args.enc_cd or md / "encoder_cd_alpha.pt"

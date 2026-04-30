@@ -15,17 +15,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.csv_tensor_cache import load_or_build_cache
+from core.device import resolve_device
 from core.figures_path import figures_dir
 from core.cst_kulfan import CSTDecoder18, CSTEncoder18
 from core.pair_tanh_autoencoder import PairTanhAutoencoder
-
-
-def resolve_device(requested: str) -> torch.device:
-    if requested == "auto":
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-    return torch.device(requested)
 
 
 def collect_pair_latents(
@@ -68,7 +61,7 @@ def main() -> None:
     ap.add_argument("--cache", type=Path, default=ROOT / "models" / "original_tensors.pt")
     ap.add_argument("--rebuild-cache", action="store_true")
     ap.add_argument("--max-rows", type=int, default=800)
-    ap.add_argument("--device", default="auto", choices=["auto", "cpu", "mps"])
+    ap.add_argument("--device", default="cuda", choices=["auto", "cpu", "mps", "cuda"])
     args = ap.parse_args()
 
     device = resolve_device(args.device)

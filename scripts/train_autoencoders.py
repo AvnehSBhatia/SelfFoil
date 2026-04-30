@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.csv_tensor_cache import load_or_build_cache
+from core.device import configure_cuda_training, resolve_device
 from core.figures_path import figures_dir
 from core.cst_kulfan import CSTDecoder18, CSTEncoder18
 from core.pair_tanh_autoencoder import PairTanhAutoencoder
@@ -25,14 +26,6 @@ from core.pair_tanh_autoencoder import PairTanhAutoencoder
 
 def mae_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return (pred - target).abs().mean()
-
-
-def resolve_device(requested: str) -> torch.device:
-    if requested == "auto":
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-    return torch.device(requested)
 
 
 def move_bundle_to_device(bundle: dict, device: torch.device) -> dict:
@@ -142,10 +135,11 @@ def main() -> None:
     p.add_argument("--max-rows", type=int, default=None, help="Cap CSV rows before caching")
     p.add_argument("--batch-points", type=int, default=131072, help="Polar samples per pair-AE step")
     p.add_argument("--batch-rows", type=int, default=512, help="Airfoil rows per CST MAE batch")
-    p.add_argument("--device", default="auto", choices=["auto", "cpu", "mps"])
+    p.add_argument("--device", default="cuda", choices=["auto", "cpu", "mps", "cuda"])
     args = p.parse_args()
 
     device = resolve_device(args.device)
+    configure_cuda_training(device, deterministic=False)
     models_dir = ROOT / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
 

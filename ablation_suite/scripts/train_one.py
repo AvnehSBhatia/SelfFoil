@@ -25,13 +25,13 @@ from ablation_suite.catalog import get_spec
 from ablation_suite.models.registry import resolve_run_key, run_path_parts
 from ablation_suite.models.whisp_ablated import WHISPAblated
 from core.csv_tensor_cache import load_or_build_cache
+from core.device import configure_cuda_training, resolve_device
 from core.figures_path import figures_dir
 from scripts.train_whisp import (
     airfoil_row_splits,
     move_bundle,
     polar_mask_for_rows,
     required_bundle_keys,
-    resolve_device,
 )
 
 
@@ -71,7 +71,7 @@ def main() -> None:
     p.add_argument("--frac-train", type=float, default=0.8)
     p.add_argument("--frac-val", type=float, default=0.1)
     p.add_argument("--max-rows", type=int, default=None)
-    p.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
+    p.add_argument("--device", default="cuda", choices=["auto", "cpu", "mps", "cuda"])
     p.add_argument("--models-dir", type=Path, default=ROOT / "models")
     p.add_argument("--enc-cl", type=Path, default=None)
     p.add_argument("--enc-cd", type=Path, default=None)
@@ -83,6 +83,7 @@ def main() -> None:
 
     set_seed(args.seed, args.deterministic)
     device = resolve_device(args.device)
+    configure_cuda_training(device, deterministic=args.deterministic)
     run_key = resolve_run_key(args.run_id, args.model)
     spec = get_spec(run_key)
     train_cfg = dict(spec["train"])

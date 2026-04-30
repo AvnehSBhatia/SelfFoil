@@ -22,12 +22,12 @@ if str(ROOT) not in sys.path:
 from ablation_suite.models.whisp_ablated import WHISPAblated
 from core.csv_tensor_cache import load_or_build_cache
 from core.figures_path import figures_dir
+from core.device import resolve_device
 from scripts.train_whisp import (
     airfoil_row_splits,
     move_bundle,
     polar_mask_for_rows,
     required_bundle_keys,
-    resolve_device,
 )
 
 
@@ -50,7 +50,7 @@ def main() -> None:
     p.add_argument("--cache", type=Path, default=ROOT / "models" / "original_tensors.pt")
     p.add_argument("--rebuild-cache", action="store_true")
     p.add_argument("--max-rows", type=int, default=None)
-    p.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
+    p.add_argument("--device", default="cuda", choices=["auto", "cpu", "mps", "cuda"])
     p.add_argument("--batch", type=int, default=512)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--frac-train", type=float, default=0.8)

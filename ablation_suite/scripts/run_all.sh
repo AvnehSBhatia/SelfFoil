@@ -14,7 +14,7 @@ fi
 
 SUITE="${REPO}/ablation_suite"
 EPOCHS="${EPOCHS:-80}"
-DEVICE="${DEVICE:-auto}"
+DEVICE="${DEVICE:-cuda}"
 EFF="${RUN_DATA_EFFICIENCY:-1}"
 
 mkdir -p "${SUITE}/logs" "${SUITE}/figures"

@@ -16,7 +16,7 @@ bash ablation_suite/scripts/run_all.sh
 ```
 
 - `FULL_SUITE=1` — train **every** catalog entry (very long).
-- `EPOCHS=40`, `DEVICE=cuda`, `RUN_DATA_EFFICIENCY=0` — optional env overrides.
+- `EPOCHS=40`, `RUN_DATA_EFFICIENCY=0` — optional. **Default device is CUDA** in `run_all.sh`; without an NVIDIA GPU use `DEVICE=auto`, `cpu`, or `mps`.
 
 ## Single run
 
