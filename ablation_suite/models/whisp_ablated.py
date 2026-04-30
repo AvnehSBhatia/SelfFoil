@@ -245,6 +245,7 @@ class WHISPAblated(nn.Module):
         self.head_cst = nn.Linear(d, 18)
         self.head_cl = nn.Linear(d, 1)
         self.register_buffer("delta_damping", torch.tensor(0.3, dtype=torch.float32))
+        self.delta_damping_value = 0.3
         nx = int(m["physics_nx"])
         if self.use_physics:
             self.pre_physics = PreDeltaPhysics(
@@ -345,7 +346,7 @@ class WHISPAblated(nn.Module):
             aux["embed_distill"] = F.mse_loss(E, Et.detach())
         u = E.mean(dim=1)
         u_mean_fixed = u
-        damp = float(self.delta_damping.item())
+        damp = self.delta_damping_value
         tau = max(float(route_tau), 1e-3)
         outer_indices = list(range(self.n_outer))
         if self.outer_order == "reversed":

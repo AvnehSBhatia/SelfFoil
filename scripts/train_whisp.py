@@ -36,7 +36,7 @@ def move_bundle(bundle: dict, device: torch.device) -> dict:
 
 
 def _fetch_batch(bundle_cpu: dict, idx: torch.Tensor, key: str, device: torch.device) -> torch.Tensor:
-    return bundle_cpu[key][idx.cpu()].to(device, non_blocking=True)
+    return bundle_cpu[key][idx].to(device, non_blocking=True)
 
 
 def airfoil_row_splits(n_rows: int, seed: int, frac_train: float, frac_val: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -107,7 +107,7 @@ def main() -> None:
     p.add_argument("--frac-train", type=float, default=0.8)
     p.add_argument("--frac-val", type=float, default=0.1)
     p.add_argument("--max-rows", type=int, default=None)
-    p.add_argument("--device", default="mps", choices=["auto", "cpu", "mps", "cuda"])
+    p.add_argument("--device", default="cuda", choices=["auto", "cpu", "mps", "cuda"])
     p.add_argument("--out", type=Path, default=ROOT / "models" / "whisp.pt")
     p.add_argument("--models-dir", type=Path, default=ROOT / "models", help="Directory with encoder_*.pt from train_autoencoders")
     p.add_argument("--enc-cl", type=Path, default=None)
@@ -149,8 +149,6 @@ def main() -> None:
     val_mask = polar_mask_for_rows(polar_row_cpu, val_rows)
     train_idx = torch.nonzero(train_mask, as_tuple=False).squeeze(-1)
     val_idx = torch.nonzero(val_mask, as_tuple=False).squeeze(-1)
-    train_idx_device = train_idx.to(device, non_blocking=True)
-    val_idx_device = val_idx.to(device, non_blocking=True)
     if train_idx.numel() == 0 or val_idx.numel() == 0:
         raise SystemExit("Empty train or val polar split; adjust fractions or dataset size.")
 
@@ -165,7 +163,7 @@ def main() -> None:
         re_log = _fetch_batch(bundle_cpu, idx, "re_log_flat", device)
         mach = _fetch_batch(bundle_cpu, idx, "mach_flat", device)
         alpha = _fetch_batch(bundle_cpu, idx, "alpha_flat", device)
-        row = bundle_cpu["polar_row_idx"][idx.cpu()]
+        row = bundle_cpu["polar_row_idx"][idx]
         cst_tgt = bundle_cpu["cst18"][row].to(device, non_blocking=True)
 
         cst_pred, aux = model(cl, cd, re_log, mach, alpha, route_tau=route_tau)
@@ -185,6 +183,9 @@ def main() -> None:
     print(f"Device={device} | train polar={train_idx.numel()} val polar={val_idx.numel()} | rows={n_rows}")
     n_trainable = sum(x.numel() for x in model_base.parameters() if x.requires_grad)
     print(f"WHISP trainable parameters: {n_trainable} (pair encoders frozen)")
+    with torch.no_grad():
+        warm_idx = train_idx[: min(args.batch, train_idx.numel())]
+        _ = forward_losses(warm_idx, args.tau_start)
 
     hist_train_loss: list[float] = []
     hist_val_loss: list[float] = []
@@ -199,7 +200,7 @@ def main() -> None:
         tau = route_tau_schedule(ep, args.epochs, args.tau_start, args.tau_end)
         model.train()
         perm_idx = torch.randperm(train_idx.numel(), device="cpu")
-        perm = train_idx_device[perm_idx.to(device, non_blocking=True)]
+        perm = train_idx[perm_idx]
         run_loss = torch.zeros((), device=device, dtype=torch.float32)
         run_parts: dict[str, torch.Tensor] = {
             "geo": torch.zeros((), device=device, dtype=torch.float32),
@@ -227,12 +228,12 @@ def main() -> None:
         with torch.no_grad():
             v_loss = torch.zeros((), device=device, dtype=torch.float32)
             v_geo = torch.zeros((), device=device, dtype=torch.float32)
-            for s in range(0, val_idx_device.numel(), args.batch):
-                sl = val_idx_device[s : s + args.batch]
+            for s in range(0, val_idx.numel(), args.batch):
+                sl = val_idx[s : s + args.batch]
                 lf, parts = forward_losses(sl, val_tau)
                 v_loss = v_loss + lf.detach()
                 v_geo = v_geo + parts["geo"].detach()
-            v_n = max(1, (val_idx_device.numel() + args.batch - 1) // args.batch)
+            v_n = max(1, (val_idx.numel() + args.batch - 1) // args.batch)
             v_loss = (v_loss / v_n).item()
             v_geo = (v_geo / v_n).item()
 

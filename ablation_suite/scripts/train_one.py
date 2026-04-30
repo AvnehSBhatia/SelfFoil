@@ -35,7 +35,7 @@ from scripts.train_whisp import (
 
 
 def _fetch_batch(bundle_cpu: dict, idx: torch.Tensor, key: str, device: torch.device) -> torch.Tensor:
-    return bundle_cpu[key][idx.cpu()].to(device, non_blocking=True)
+    return bundle_cpu[key][idx].to(device, non_blocking=True)
 
 
 def set_seed(seed: int, deterministic: bool) -> None:
@@ -128,8 +128,6 @@ def main() -> None:
     val_mask = polar_mask_for_rows(polar_row_cpu, val_rows)
     train_idx = torch.nonzero(train_mask, as_tuple=False).squeeze(-1)
     val_idx = torch.nonzero(val_mask, as_tuple=False).squeeze(-1)
-    train_idx_device = train_idx.to(device, non_blocking=True)
-    val_idx_device = val_idx.to(device, non_blocking=True)
     if train_idx.numel() == 0 or val_idx.numel() == 0:
         raise SystemExit("Empty train or val split.")
 
@@ -139,11 +137,8 @@ def main() -> None:
         va_min_t = torch.tensor(float(va_min), device=device, dtype=re_log_all.dtype)
         train_idx = train_idx[re_log_all[train_idx] < float(tr_max)]
         val_idx = val_idx[re_log_all[val_idx] >= float(va_min)]
-        train_idx_device = train_idx.to(device, non_blocking=True)
-        val_idx_device = val_idx.to(device, non_blocking=True)
     if stride > 1:
         train_idx = train_idx[torch.arange(train_idx.numel()) % stride == 0]
-        train_idx_device = train_idx.to(device, non_blocking=True)
 
     model_base = WHISPAblated(encoder_ckpts, spec).to(device)
     model = torch.compile(model_base) if args.compile and hasattr(torch, "compile") else model_base
@@ -163,7 +158,7 @@ def main() -> None:
             re_log = re_log + torch.randn_like(re_log) * noise_std
             mach = mach + torch.randn_like(mach) * noise_std
             alpha = alpha + torch.randn_like(alpha) * noise_std
-        row = bundle_cpu["polar_row_idx"][idx.cpu()]
+        row = bundle_cpu["polar_row_idx"][idx]
         cst_tgt = bundle_cpu["cst18"][row].to(device, non_blocking=True)
 
         cst_pred, aux = model(cl, cd, re_log, mach, alpha)
@@ -206,11 +201,14 @@ def main() -> None:
         f"WHISP run={run_key} device={device} train={train_idx.numel()} val={val_idx.numel()} "
         f"trainable={count_trainable(model_for_meta)} loss={loss_profile}"
     )
+    with torch.no_grad():
+        warm_idx = train_idx[: min(args.batch, train_idx.numel())]
+        _ = forward_losses(warm_idx, 0)
 
     for ep in range(args.epochs):
         model.train()
         perm_idx = torch.randperm(train_idx.numel(), device="cpu")
-        perm = train_idx_device[perm_idx.to(device, non_blocking=True)]
+        perm = train_idx[perm_idx]
         run_loss = torch.zeros((), device=device, dtype=torch.float32)
         run_geo = torch.zeros((), device=device, dtype=torch.float32)
         n_batches = 0
@@ -228,12 +226,12 @@ def main() -> None:
         v_loss = torch.zeros((), device=device, dtype=torch.float32)
         v_geo = torch.zeros((), device=device, dtype=torch.float32)
         with torch.no_grad():
-            for s in range(0, val_idx_device.numel(), args.batch):
-                sl = val_idx_device[s : s + args.batch]
+            for s in range(0, val_idx.numel(), args.batch):
+                sl = val_idx[s : s + args.batch]
                 lf, parts = forward_losses(sl, ep)
                 v_loss = v_loss + lf.detach()
                 v_geo = v_geo + parts["geo"].detach()
-        v_n = max(1, (val_idx_device.numel() + args.batch - 1) // args.batch)
+        v_n = max(1, (val_idx.numel() + args.batch - 1) // args.batch)
         v_loss = (v_loss / v_n).item()
         v_geo = (v_geo / v_n).item()
         if n_batches:

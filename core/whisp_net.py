@@ -92,6 +92,7 @@ class WHISP(nn.Module):
         self.pre_physics = PreDeltaPhysics(z_dim=d)
         self.delta_transformer = DeltaTransformer(z_dim=d)
         self.register_buffer("delta_damping", torch.tensor(0.3, dtype=torch.float32))
+        self.delta_damping_value = 0.3
 
     def _stack_pairs(
         self,
@@ -142,8 +143,7 @@ class WHISP(nn.Module):
             aux[f"cl_gamma_{k}"] = cl_gamma
 
             du = self.delta_transformer(raw_delta)
-            damp = float(self.delta_damping.item())
-            u = raw_delta + damp * du
+            u = raw_delta + self.delta_damping_value * du
 
             B = E.shape[0]
             E = self.post_stage_ln(E.contiguous().view(-1, self.d)).view(B, self.n_emb, self.d)
