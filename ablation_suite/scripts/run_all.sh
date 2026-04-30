@@ -82,18 +82,23 @@ TRAIN=(
   --stage-cycles "${STAGE_CYCLES}"
   --suite-root "${SUITE}"
 )
+
 if [[ "${TWO_STAGE}" == "1" ]]; then
   TRAIN+=(--two-stage)
 fi
+
 if [[ "${COMPILE}" == "1" ]]; then
   TRAIN+=(--compile)
 fi
+
 if [[ "${WARMUP}" == "1" ]]; then
   TRAIN+=(--warmup)
 fi
+
 if [[ -n "${MAX_ROWS}" ]]; then
   TRAIN+=(--max-rows "${MAX_ROWS}")
 fi
+
 EVAL=("${PYTHON_EXE}" "${SUITE}/scripts/evaluate.py" --device "${DEVICE}" --suite-root "${SUITE}")
 
 if [[ "${FULL_SUITE:-0}" == "1" ]]; then
@@ -125,7 +130,9 @@ for rid in "${IDS[@]}"; do
   cat="${rid%%/*}"
   slug="${rid#*/}"
   mkdir -p "${SUITE}/runs/${cat}/${slug}"
+
   RUN_ARGS=("${TRAIN[@]}")
+
   # Two-stage geo<->aux switching is not meaningful when physics is fully disabled.
   if [[ "${TWO_STAGE}" == "1" && "${rid}" == */no_physics ]]; then
     FILTERED=()
@@ -136,6 +143,7 @@ for rid in "${IDS[@]}"; do
     done
     RUN_ARGS=("${FILTERED[@]}")
   fi
+
   "${RUN_ARGS[@]}" --run-id "${rid}"
 done
 
@@ -146,20 +154,10 @@ if [[ "${EFF}" == "1" ]]; then
     "${EVAL[@]}" --run-ids baseline/full --metrics-path "${SUITE}/logs/efficiency.jsonl"
   done
 fi
-"${TRAIN[@]}" --run-id baseline/full --frac-train 0.8 --epochs "${EPOCHS}"
-
-if [[ -f "${SUITE}/runs/baseline/full/model.pt" ]]; then
-  mkdir -p "${SUITE}/runs/baseline/base"
-  cp -f "${SUITE}/runs/baseline/full/model.pt" "${SUITE}/runs/baseline/base/model.pt"
-  for f in history.json train_summary.json; do
-    if [[ -f "${SUITE}/runs/baseline/full/${f}" ]]; then
-      cp -f "${SUITE}/runs/baseline/full/${f}" "${SUITE}/runs/baseline/base/${f}"
-    fi
-  done
-fi
 
 : > "${SUITE}/logs/metrics.jsonl"
 "${PYTHON_EXE}" "${SUITE}/scripts/evaluate.py" --suite-root "${SUITE}"
 
 "${PYTHON_EXE}" "${SUITE}/scripts/plot_results.py" --suite-root "${SUITE}"
+
 echo "Done. All figures: ${REPO}/figures/ | Metrics: ${SUITE}/logs/metrics.jsonl"
