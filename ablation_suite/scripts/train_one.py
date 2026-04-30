@@ -79,6 +79,7 @@ def main() -> None:
     p.add_argument("--enc-mach", type=Path, default=None)
     p.add_argument("--deterministic", action="store_true")
     p.add_argument("--suite-root", type=Path, default=ROOT / "ablation_suite")
+    p.add_argument("--compile", action="store_true", help="Compile model with torch.compile for faster training")
     args = p.parse_args()
 
     set_seed(args.seed, args.deterministic)
@@ -137,9 +138,11 @@ def main() -> None:
     if stride > 1:
         train_idx = train_idx[torch.arange(train_idx.numel(), device=device) % stride == 0]
 
-    model = WHISPAblated(encoder_ckpts, spec).to(device)
+    model_base = WHISPAblated(encoder_ckpts, spec).to(device)
+    model = torch.compile(model_base) if args.compile and hasattr(torch, "compile") else model_base
     opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
     distill_w = float(spec.get("distill_weight", 0.0) or 0.0)
+    model_for_meta = model_base
 
     def forward_losses(idx: torch.Tensor, ep: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         cl = bundle["cl_flat"][idx]
@@ -159,12 +162,10 @@ def main() -> None:
         cst_pred, aux = model(cl, cd, re_log, mach, alpha)
         l_geo = (cst_pred - cst_tgt).abs().mean()
         parts: dict[str, torch.Tensor] = {"geo": l_geo}
-        l_ns_mean = torch.tensor(0.0, device=device)
-        if model.use_physics and aux["L_ns_list"]:
-            l_ns_mean = torch.stack(aux["L_ns_list"]).mean()
+        l_ns_mean = aux["L_ns"] if model_for_meta.use_physics else torch.tensor(0.0, device=device)
         parts["ns"] = l_ns_mean
         cl_keys = [k for k in aux if k.startswith("cl_gamma_")]
-        last_k = max((int(k.split("_")[-1]) for k in cl_keys), default=model.n_outer - 1)
+        last_k = max((int(k.split("_")[-1]) for k in cl_keys), default=model_for_meta.n_outer - 1)
         l_cl_g = torch.tensor(0.0, device=device)
         if f"cl_gamma_{last_k}" in aux:
             l_cl_g = nn.functional.mse_loss(aux[f"cl_gamma_{last_k}"], cl)
@@ -178,12 +179,12 @@ def main() -> None:
         if loss_profile == "geo_only":
             loss = l_geo
         elif loss_profile == "aero_only":
-            loss = l_cl_g if model.use_physics and f"cl_gamma_{last_k}" in aux else l_cl_head
+            loss = l_cl_g if model_for_meta.use_physics and f"cl_gamma_{last_k}" in aux else l_cl_head
         elif loss_profile == "no_geo":
-            loss = lam_ns_ep * l_ns_mean + lam_cl_ep * l_cl_g if model.use_physics else l_cl_head
+            loss = lam_ns_ep * l_ns_mean + lam_cl_ep * l_cl_g if model_for_meta.use_physics else l_cl_head
         else:
             loss = l_geo
-            if model.use_physics and aux["L_ns_list"]:
+            if model_for_meta.use_physics:
                 loss = loss + lam_ns_ep * l_ns_mean + lam_cl_ep * l_cl_g
         if distill_w > 0.0 and "embed_distill" in aux:
             loss = loss + distill_w * aux["embed_distill"]
@@ -196,14 +197,15 @@ def main() -> None:
 
     print(
         f"WHISP run={run_key} device={device} train={train_idx.numel()} val={val_idx.numel()} "
-        f"trainable={count_trainable(model)} loss={loss_profile}"
+        f"trainable={count_trainable(model_for_meta)} loss={loss_profile}"
     )
 
     for ep in range(args.epochs):
         model.train()
-        perm = train_idx[torch.randperm(train_idx.numel(), device=device)]
-        run_loss = 0.0
-        run_geo = 0.0
+        perm_idx = torch.randperm(train_idx.numel(), device="cpu")
+        perm = train_idx[perm_idx.to(train_idx.device, non_blocking=True)]
+        run_loss = torch.zeros((), device=device, dtype=torch.float32)
+        run_geo = torch.zeros((), device=device, dtype=torch.float32)
         n_batches = 0
         for s in range(0, perm.numel(), args.batch):
             sl = perm[s : s + args.batch]
@@ -211,25 +213,28 @@ def main() -> None:
             loss, parts = forward_losses(sl, ep)
             loss.backward()
             opt.step()
-            run_loss += float(loss.detach())
-            run_geo += float(parts["geo"].detach())
+            run_loss = run_loss + loss.detach()
+            run_geo = run_geo + parts["geo"].detach()
             n_batches += 1
 
         model.eval()
-        v_loss = 0.0
-        v_geo = 0.0
+        v_loss = torch.zeros((), device=device, dtype=torch.float32)
+        v_geo = torch.zeros((), device=device, dtype=torch.float32)
         with torch.no_grad():
             for s in range(0, val_idx.numel(), args.batch):
                 sl = val_idx[s : s + args.batch]
                 lf, parts = forward_losses(sl, ep)
-                v_loss += float(lf)
-                v_geo += float(parts["geo"])
+                v_loss = v_loss + lf.detach()
+                v_geo = v_geo + parts["geo"].detach()
         v_n = max(1, (val_idx.numel() + args.batch - 1) // args.batch)
-        v_loss /= v_n
-        v_geo /= v_n
+        v_loss = (v_loss / v_n).item()
+        v_geo = (v_geo / v_n).item()
         if n_batches:
-            run_loss /= n_batches
-            run_geo /= n_batches
+            run_loss = (run_loss / n_batches).item()
+            run_geo = (run_geo / n_batches).item()
+        else:
+            run_loss = float(run_loss.item())
+            run_geo = float(run_geo.item())
 
         history.append(
             {
@@ -250,14 +255,14 @@ def main() -> None:
         "slug": slug,
         "spec": {k: v for k, v in spec.items() if k != "train"},
         "train": train_cfg,
-        "n_outer": model.n_outer,
-        "n_inner": model.n_inner,
-        "d": model.d,
+        "n_outer": model_for_meta.n_outer,
+        "n_inner": model_for_meta.n_inner,
+        "d": model_for_meta.d,
         "encoder_ckpts": [str(x) for x in encoder_ckpts],
         "train_rows": train_rows.cpu(),
         "val_rows": val_rows.cpu(),
         "test_rows": test_rows.cpu(),
-        "trainable_params": count_trainable(model),
+        "trainable_params": count_trainable(model_for_meta),
         "epochs": args.epochs,
         "frac_train": frac_train,
         "frac_val": frac_val,

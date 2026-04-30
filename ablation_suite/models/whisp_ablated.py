@@ -80,53 +80,53 @@ class InnerBlockAblated(nn.Module):
         elif interaction == "no_cross":
             self.mix_lin = nn.Linear(d, d)
 
-    def _B(self, i: int) -> torch.Tensor:
-        if self.B_shared is not None:
-            return self.B_shared
-        assert self.B is not None
-        return self.B[i]
-
     def forward(self, E: torch.Tensor, u: torch.Tensor, route_tau: float = 1.0) -> torch.Tensor:
         tau = max(float(route_tau), 1e-3)
-        h_parts = []
-        for i in range(self.n_emb):
-            ei = E[:, i, :]
-            if self.interaction == "bilinear":
-                outer = torch.bmm(ei.unsqueeze(2), u.unsqueeze(1))
-                M = outer + self._B(i)
-                hi = self.W_proj(M.reshape(E.shape[0], -1))
-            elif self.interaction == "linear_concat":
-                hi = self.mix_lin(torch.cat([ei, u], dim=-1))
-            elif self.interaction == "hadamard":
-                hi = self.mix_lin(ei * u)
-            elif self.interaction == "attention":
-                outer = torch.bmm(ei.unsqueeze(2), u.unsqueeze(1))
-                M = outer + self._B(i)
-                hi = self.W_proj(M.reshape(E.shape[0], -1))
-            elif self.interaction == "no_cross":
-                hi = self.mix_lin(ei * u)
+        inv_tau = 1.0 / tau
+        B, n_emb, d = E.shape
+        if self.interaction == "bilinear":
+            u_exp = u.unsqueeze(1).unsqueeze(2)
+            E_exp = E.unsqueeze(3)
+            outer = E_exp * u_exp
+            if self.B_shared is not None:
+                M = outer + self.B_shared.view(1, 1, d, d)
             else:
-                raise ValueError(f"unknown interaction {self.interaction}")
-            h_parts.append(hi)
-        H = torch.stack(h_parts, dim=1)
-        updated = []
+                assert self.B is not None
+                M = outer + self.B.unsqueeze(0)
+            H = self.W_proj(M.contiguous().view(B, n_emb, d * d))
+        elif self.interaction == "linear_concat":
+            u_exp = u.unsqueeze(1).expand(B, n_emb, d)
+            H = self.mix_lin(torch.cat([E, u_exp], dim=-1))
+        elif self.interaction == "hadamard":
+            H = self.mix_lin(E * u.unsqueeze(1))
+        elif self.interaction == "attention":
+            u_exp = u.unsqueeze(1).unsqueeze(2)
+            E_exp = E.unsqueeze(3)
+            outer = E_exp * u_exp
+            if self.B_shared is not None:
+                M = outer + self.B_shared.view(1, 1, d, d)
+            else:
+                assert self.B is not None
+                M = outer + self.B.unsqueeze(0)
+            H = self.W_proj(M.contiguous().view(B, n_emb, d * d))
+        elif self.interaction == "no_cross":
+            H = self.mix_lin(E * u.unsqueeze(1))
+        else:
+            raise ValueError(f"unknown interaction {self.interaction}")
+
         if self.interaction == "attention":
             dots = (E * u.unsqueeze(1)).sum(dim=-1) * self.attn_scale
             a = torch.softmax(dots / tau, dim=-1)
             mix = (a.unsqueeze(-1) * E).sum(dim=1)
-            for i in range(self.n_emb):
-                updated.append(E[:, i, :] + mix)
-            return torch.stack(updated, dim=1)
+            return E + mix.unsqueeze(1)
         if self.routing == "mean_h":
             mix = H.mean(dim=1)
-            for i in range(self.n_emb):
-                updated.append(E[:, i, :] + mix)
-            return torch.stack(updated, dim=1)
-        for i in range(self.n_emb):
-            s = torch.softmax(self.route(H[:, i, :]) / tau, dim=-1)
-            mix = (s.unsqueeze(-1) * H).sum(dim=1)
-            updated.append(E[:, i, :] + mix)
-        return torch.stack(updated, dim=1)
+            return E + mix.unsqueeze(1)
+        inv_tau = 1.0 / tau
+        route_logits = self.route(H) * inv_tau
+        S = torch.softmax(route_logits, dim=-1)
+        mix = torch.einsum("bij,bjd->bid", S, H)
+        return E + mix
 
 
 class OuterStageAblated(nn.Module):
@@ -151,7 +151,7 @@ class OuterStageAblated(nn.Module):
         return E
 
     def mix_aero(self, E: torch.Tensor) -> torch.Tensor:
-        logits = self.w_aero_logits(E.reshape(E.shape[0], -1))
+        logits = self.w_aero_logits(E.view(E.shape[0], -1))
         w = torch.softmax(logits, dim=-1)
         return (w.unsqueeze(-1) * E).sum(dim=1)
 
@@ -338,7 +338,7 @@ class WHISPAblated(nn.Module):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         pairs = self._stack_pairs(cl, cd, re_log, mach, alpha)
         E = self.embed(pairs)
-        aux: dict[str, torch.Tensor] = {"L_ns_list": []}
+        aux: dict[str, torch.Tensor] = {}
         if self.teacher_embeds is not None and self.distill_weight > 0.0:
             with torch.no_grad():
                 Et = torch.stack([self.teacher_embeds[i](pairs[:, i, :]) for i in range(self.n_emb)], dim=1)
@@ -350,17 +350,20 @@ class WHISPAblated(nn.Module):
         outer_indices = list(range(self.n_outer))
         if self.outer_order == "reversed":
             outer_indices = outer_indices[::-1]
+        l_ns_acc: torch.Tensor | None = None
+        n_phys = 0
         for step_i, k in enumerate(outer_indices):
             stage = self.stages[0] if self._shared_outer else self.stages[k]
             u_loop = u_mean_fixed if not self.use_delta else u
             E = stage.run_inner(E, u_loop, route_tau=tau)
             a = stage.mix_aero(E)
             logits = (E * a.unsqueeze(1)).sum(dim=-1)
-            scores = torch.softmax(logits / tau, dim=-1)
+            scores = torch.softmax(logits * inv_tau, dim=-1)
             raw_delta = (scores.unsqueeze(-1) * E).sum(dim=1)
             if self.use_physics and self.pre_physics is not None:
                 L_ns, cl_gamma = self.pre_physics(raw_delta)
-                aux["L_ns_list"].append(L_ns)
+                l_ns_acc = L_ns if l_ns_acc is None else l_ns_acc + L_ns
+                n_phys += 1
                 aux[f"cl_gamma_{k}"] = cl_gamma
             if self.delta_mode == "identity":
                 u = raw_delta
@@ -370,9 +373,13 @@ class WHISPAblated(nn.Module):
                 du = self._delta_du(raw_delta)
                 decay = self.outer_decay**step_i
                 u = raw_delta + damp * decay * du
-            B, four, d_ = E.shape
-            E = self.post_stage_ln(E.reshape(-1, d_)).reshape(B, four, d_)
-        logits_out = self.w_out_logits(E.reshape(E.shape[0], -1))
+            B = E.shape[0]
+            E = self.post_stage_ln(E.contiguous().view(-1, self.d)).view(B, self.n_emb, self.d)
+        if l_ns_acc is not None and n_phys > 0:
+            aux["L_ns"] = l_ns_acc.mean() / n_phys
+        else:
+            aux["L_ns"] = torch.zeros((), device=E.device, dtype=E.dtype)
+        logits_out = self.w_out_logits(E.view(E.shape[0], -1))
         w_out = torch.softmax(logits_out, dim=-1)
         a_final = (w_out.unsqueeze(-1) * E).sum(dim=1)
         a_final = self.final_norm(a_final)

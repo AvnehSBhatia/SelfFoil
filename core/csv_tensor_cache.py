@@ -4,17 +4,37 @@ from __future__ import annotations
 
 import csv
 import json
+from collections import defaultdict
 from pathlib import Path
 
 import torch
 
-from .cst_kulfan import fit_cst18_from_xy
+from .cst_kulfan import fit_cst18_from_xy_batched
 
 
 def cache_stale(csv_path: Path, cache_path: Path) -> bool:
     if not cache_path.is_file():
         return True
     return csv_path.stat().st_mtime > cache_path.stat().st_mtime
+
+
+def _fill_cst18_batched(
+    cst18: torch.Tensor,
+    xy_list: list[torch.Tensor],
+    *,
+    chunk_size: int = 512,
+) -> None:
+    """Write CST rows into cst18[in_rows] using batched least squares."""
+    by_len: dict[int, list[tuple[int, torch.Tensor]]] = defaultdict(list)
+    for i, xy in enumerate(xy_list):
+        by_len[int(xy.shape[0])].append((i, xy))
+    for _length, items in by_len.items():
+        for start in range(0, len(items), chunk_size):
+            chunk = items[start : start + chunk_size]
+            batch_xy = torch.stack([t[1] for t in chunk], dim=0)
+            out = fit_cst18_from_xy_batched(batch_xy)
+            row_ids = torch.tensor([t[0] for t in chunk], dtype=torch.long)
+            cst18[row_ids] = out
 
 
 def build_tensor_bundle(rows: list[dict]) -> dict[str, torch.Tensor | int]:
@@ -38,7 +58,7 @@ def build_tensor_bundle(rows: list[dict]) -> dict[str, torch.Tensor | int]:
 
     off = 0
     coord_rows: list[torch.Tensor] = []
-    cst_rows: list[torch.Tensor] = []
+    xy_list: list[torch.Tensor] = []
     x_coords_template: torch.Tensor | None = None
 
     for row_i, row in enumerate(rows):
@@ -61,14 +81,14 @@ def build_tensor_bundle(rows: list[dict]) -> dict[str, torch.Tensor | int]:
 
         xy = torch.tensor(json.loads(row["coords"]), dtype=torch.float32).reshape(-1, 2)
         coord_rows.append(xy.reshape(-1))
-        cst_rows.append(
-            fit_cst18_from_xy(xy, n_weights_per_side=8, n1=0.5, n2=1.0, ridge=1e-6)
-        )
+        xy_list.append(xy)
         if x_coords_template is None:
             x_coords_template = xy[:, 0].clone()
 
     coords = torch.stack(coord_rows, dim=0)
-    cst18 = torch.stack(cst_rows, dim=0)
+    cst18 = torch.empty(n, 18, dtype=torch.float32)
+    if n:
+        _fill_cst18_batched(cst18, xy_list)
     assert x_coords_template is not None
     return {
         "alpha_flat": alpha_flat,

@@ -110,6 +110,7 @@ def main() -> None:
     p.add_argument("--enc-cd", type=Path, default=None)
     p.add_argument("--enc-re", type=Path, default=None)
     p.add_argument("--enc-mach", type=Path, default=None)
+    p.add_argument("--compile", action="store_true", help="Compile model with torch.compile for faster training")
     args = p.parse_args()
 
     device = resolve_device(args.device)
@@ -148,9 +149,10 @@ def main() -> None:
     if train_idx.numel() == 0 or val_idx.numel() == 0:
         raise SystemExit("Empty train or val polar split; adjust fractions or dataset size.")
 
-    model = WHISP(encoder_ckpts=encoder_ckpts).to(device)
+    model_base = WHISP(encoder_ckpts=encoder_ckpts).to(device)
+    model = torch.compile(model_base) if args.compile and hasattr(torch, "compile") else model_base
     opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
-    last_k = model.n_outer - 1
+    last_k = model_base.n_outer - 1
 
     def forward_losses(idx: torch.Tensor, route_tau: float) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         cl = bundle["cl_flat"][idx]
@@ -163,7 +165,7 @@ def main() -> None:
 
         cst_pred, aux = model(cl, cd, re_log, mach, alpha, route_tau=route_tau)
         l_geo = (cst_pred - cst_tgt).abs().mean()
-        l_ns = torch.stack(aux["L_ns_list"]).mean()
+        l_ns = aux["L_ns"]
         l_cl_g = nn.functional.mse_loss(aux[f"cl_gamma_{last_k}"], cl)
         l_cl_d = nn.functional.mse_loss(aux["cl_direct"], cl)
         loss = (
@@ -176,7 +178,7 @@ def main() -> None:
         return loss, parts
 
     print(f"Device={device} | train polar={train_idx.numel()} val polar={val_idx.numel()} | rows={n_rows}")
-    n_trainable = sum(x.numel() for x in model.parameters() if x.requires_grad)
+    n_trainable = sum(x.numel() for x in model_base.parameters() if x.requires_grad)
     print(f"WHISP trainable parameters: {n_trainable} (pair encoders frozen)")
 
     hist_train_loss: list[float] = []
@@ -191,9 +193,15 @@ def main() -> None:
     for ep in range(args.epochs):
         tau = route_tau_schedule(ep, args.epochs, args.tau_start, args.tau_end)
         model.train()
-        perm = train_idx[torch.randperm(train_idx.numel(), device=device)]
-        run_loss = 0.0
-        run_parts: dict[str, float] = {"geo": 0.0, "ns": 0.0, "clg": 0.0, "cld": 0.0}
+        perm_idx = torch.randperm(train_idx.numel(), device="cpu")
+        perm = train_idx[perm_idx.to(train_idx.device, non_blocking=True)]
+        run_loss = torch.zeros((), device=device, dtype=torch.float32)
+        run_parts: dict[str, torch.Tensor] = {
+            "geo": torch.zeros((), device=device, dtype=torch.float32),
+            "ns": torch.zeros((), device=device, dtype=torch.float32),
+            "clg": torch.zeros((), device=device, dtype=torch.float32),
+            "cld": torch.zeros((), device=device, dtype=torch.float32),
+        }
         n_batches = 0
         for s in range(0, perm.numel(), args.batch):
             sl = perm[s : s + args.batch]
@@ -202,31 +210,35 @@ def main() -> None:
             loss.backward()
             opt.step()
 
-            run_loss += float(loss.detach())
-            run_parts["geo"] += float(parts["geo"].detach())
-            run_parts["ns"] += float(parts["ns"].detach())
-            run_parts["clg"] += float(parts["clg"].detach())
-            run_parts["cld"] += float(parts["cld"].detach())
+            run_loss = run_loss + loss.detach()
+            run_parts["geo"] = run_parts["geo"] + parts["geo"].detach()
+            run_parts["ns"] = run_parts["ns"] + parts["ns"].detach()
+            run_parts["clg"] = run_parts["clg"] + parts["clg"].detach()
+            run_parts["cld"] = run_parts["cld"] + parts["cld"].detach()
             n_batches += 1
 
         model.eval()
         val_tau = args.tau_end
         with torch.no_grad():
-            v_loss = 0.0
-            v_geo = 0.0
+            v_loss = torch.zeros((), device=device, dtype=torch.float32)
+            v_geo = torch.zeros((), device=device, dtype=torch.float32)
             for s in range(0, val_idx.numel(), args.batch):
                 sl = val_idx[s : s + args.batch]
                 lf, parts = forward_losses(sl, val_tau)
-                v_loss += float(lf)
-                v_geo += float(parts["geo"])
+                v_loss = v_loss + lf.detach()
+                v_geo = v_geo + parts["geo"].detach()
             v_n = max(1, (val_idx.numel() + args.batch - 1) // args.batch)
-            v_loss /= v_n
-            v_geo /= v_n
+            v_loss = (v_loss / v_n).item()
+            v_geo = (v_geo / v_n).item()
 
         if n_batches:
-            run_loss /= n_batches
+            run_loss = (run_loss / n_batches).item()
             for k in run_parts:
-                run_parts[k] /= n_batches
+                run_parts[k] = (run_parts[k] / n_batches).item()
+        else:
+            run_loss = float(run_loss.item())
+            for k in run_parts:
+                run_parts[k] = float(run_parts[k].item())
 
         print(
             f"epoch {ep + 1}/{args.epochs}  τ={tau:.3f}  train_loss={run_loss:.5e}  "
@@ -297,9 +309,9 @@ def main() -> None:
         {
             "model": model.state_dict(),
             "meta": {
-                "n_outer": model.n_outer,
-                "n_inner": model.stages[0].n_inner,
-                "d": model.d,
+                "n_outer": model_base.n_outer,
+                "n_inner": model_base.stages[0].n_inner,
+                "d": model_base.d,
                 "encoder_ckpts": [str(x) for x in encoder_ckpts],
                 "tau_start": args.tau_start,
                 "tau_end": args.tau_end,

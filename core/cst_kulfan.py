@@ -75,6 +75,81 @@ def _kulfan_matrix_rows(
     return torch.cat([lower_block, upper_block, le_col, te_col], dim=1)
 
 
+def _kulfan_matrix_rows_batched(
+    x: torch.Tensor,
+    is_upper: torch.Tensor,
+    n_weights_per_side: int,
+    n1: float,
+    n2: float,
+) -> torch.Tensor:
+    """x (B,N), is_upper (B,N) -> A (B,N,18)."""
+    B, N = x.shape
+    degree = n_weights_per_side - 1
+    xf = x.reshape(-1)
+    C = _class_function(xf, n1, n2).reshape(B, N)
+    S = _bernstein_basis(xf, degree).reshape(B, N, degree + 1)
+
+    lower_block = torch.where(
+        is_upper.unsqueeze(-1),
+        torch.zeros(B, N, degree + 1, dtype=x.dtype, device=x.device),
+        C.unsqueeze(-1) * S,
+    )
+    upper_block = torch.where(
+        is_upper.unsqueeze(-1),
+        C.unsqueeze(-1) * S,
+        torch.zeros(B, N, degree + 1, dtype=x.dtype, device=x.device),
+    )
+    le_col = (x * torch.clamp(1.0 - x, min=0.0) ** (n_weights_per_side + 0.5)).unsqueeze(-1)
+    te_col = torch.where(is_upper, x / 2.0, -x / 2.0).unsqueeze(-1)
+    return torch.cat([lower_block, upper_block, le_col, te_col], dim=-1)
+
+
+def fit_cst18_from_xy_batched(
+    xy: torch.Tensor,
+    n_weights_per_side: int = 8,
+    n1: float = 0.5,
+    n2: float = 1.0,
+    ridge: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Batched ridge-normal least squares for Kulfan CST+LEM.
+
+    xy: (B, N, 2) chord-ordered polylines (same convention as CSV).
+    Returns (B, 18) = [lower(8), upper(8), leading_edge_weight, TE_thickness] per row.
+    """
+    if xy.ndim != 3 or xy.shape[-1] != 2:
+        raise ValueError("fit_cst18_from_xy_batched expects xy with shape (B, N, 2).")
+    B, N, _ = xy.shape
+    x = xy[..., 0].clamp(0.0, 1.0)
+    y = xy[..., 1]
+    i_le = x.argmin(dim=1)
+    j = torch.arange(N, device=x.device, dtype=torch.long).view(1, N).expand(B, N)
+    is_upper = j <= i_le.unsqueeze(1)
+
+    A = _kulfan_matrix_rows_batched(x, is_upper, n_weights_per_side, n1, n2)
+    d = A.shape[-1]
+    AtA = torch.bmm(A.transpose(1, 2), A)
+    rhs = torch.bmm(A.transpose(1, 2), y.unsqueeze(-1))
+    eye = torch.eye(d, dtype=x.dtype, device=x.device).unsqueeze(0).expand(B, d, d)
+    coeffs = torch.linalg.solve(AtA + ridge * eye, rhs).squeeze(-1)
+
+    bad = coeffs[:, -1] < 0.0
+    if bad.any():
+        d2 = d - 1
+        A2 = A[bad, :, :-1]
+        y2 = y[bad]
+        AtA2 = torch.bmm(A2.transpose(1, 2), A2)
+        rhs2 = torch.bmm(A2.transpose(1, 2), y2.unsqueeze(-1))
+        nb = A2.shape[0]
+        eye2 = torch.eye(d2, dtype=x.dtype, device=x.device).unsqueeze(0).expand(nb, d2, d2)
+        c2 = torch.linalg.solve(AtA2 + ridge * eye2, rhs2).squeeze(-1)
+        coeffs = coeffs.clone()
+        coeffs[bad, :d2] = c2
+        coeffs[bad, -1] = 0.0
+
+    return coeffs
+
+
 def fit_cst18_from_xy(
     xy: torch.Tensor,
     n_weights_per_side: int = 8,
@@ -86,23 +161,13 @@ def fit_cst18_from_xy(
     xy: (N,2) airfoil polyline in chord order (same convention as CSV).
     Returns (18,) = [lower(8), upper(8), leading_edge_weight, TE_thickness].
     """
-    x = xy[:, 0].clamp(0.0, 1.0)
-    y = xy[:, 1]
-    i_le = int(torch.argmin(x))
-    is_upper = torch.arange(x.shape[0], device=x.device) <= i_le
-
-    A = _kulfan_matrix_rows(x, is_upper, n_weights_per_side, n1, n2)
-    I = torch.eye(A.shape[1], dtype=xy.dtype, device=xy.device)
-    coeffs = torch.linalg.solve(A.T @ A + ridge * I, A.T @ y)
-
-    # Enforce non-negative TE thickness; refit without TE column if needed.
-    if float(coeffs[-1]) < 0.0:
-        A2 = A[:, :-1]
-        I2 = torch.eye(A2.shape[1], dtype=xy.dtype, device=xy.device)
-        c2 = torch.linalg.solve(A2.T @ A2 + ridge * I2, A2.T @ y)
-        coeffs = torch.cat([c2, torch.zeros(1, dtype=xy.dtype, device=xy.device)], dim=0)
-
-    return coeffs
+    return fit_cst18_from_xy_batched(
+        xy.unsqueeze(0),
+        n_weights_per_side=n_weights_per_side,
+        n1=n1,
+        n2=n2,
+        ridge=ridge,
+    ).squeeze(0)
 
 
 class CSTEncoder18(nn.Module):
@@ -130,18 +195,14 @@ class CSTEncoder18(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, coord_dim); no trainable weights.
-        batch = []
-        for b in range(x.shape[0]):
-            xy = x[b].view(-1, 2)
-            z = fit_cst18_from_xy(
-                xy,
-                n_weights_per_side=self.n_weights_per_side,
-                n1=self.n1,
-                n2=self.n2,
-                ridge=self.ridge,
-            )
-            batch.append(z)
-        return torch.stack(batch, dim=0)
+        xy = x.view(x.shape[0], -1, 2)
+        return fit_cst18_from_xy_batched(
+            xy,
+            n_weights_per_side=self.n_weights_per_side,
+            n1=self.n1,
+            n2=self.n2,
+            ridge=self.ridge,
+        )
 
 
 class CSTDecoder18(nn.Module):

@@ -26,20 +26,18 @@ class InnerBlock(nn.Module):
     def forward(self, E: torch.Tensor, u: torch.Tensor, route_tau: float = 1.0) -> torch.Tensor:
         # E: (B, 4, 8), u: (B, 8); route_tau > 0 softens softmax (less collapse early in training).
         tau = max(float(route_tau), 1e-3)
-        h_parts = []
-        for i in range(self.n_emb):
-            ei = E[:, i, :]
-            outer = torch.bmm(ei.unsqueeze(2), u.unsqueeze(1))
-            M = outer + self.B[i]
-            hi = self.W_proj(M.reshape(E.shape[0], -1))
-            h_parts.append(hi)
-        H = torch.stack(h_parts, dim=1)
-        updated = []
-        for i in range(self.n_emb):
-            s = torch.softmax(self.route(H[:, i, :]) / tau, dim=-1)
-            mix = (s.unsqueeze(-1) * H).sum(dim=1)
-            updated.append(E[:, i, :] + mix)
-        return torch.stack(updated, dim=1)
+        inv_tau = 1.0 / tau
+        B, n_emb, d = E.shape
+        u_exp = u.unsqueeze(1).unsqueeze(2)
+        E_exp = E.unsqueeze(3)
+        outer = E_exp * u_exp
+        M = outer + self.B.unsqueeze(0)
+        H = self.W_proj(M.contiguous().view(B, n_emb, d * d))
+        inv_tau = 1.0 / tau
+        route_logits = self.route(H) * inv_tau
+        S = torch.softmax(route_logits, dim=-1)
+        mix = torch.einsum("bij,bjd->bid", S, H)
+        return E + mix
 
 
 class OuterStage(nn.Module):
@@ -57,7 +55,7 @@ class OuterStage(nn.Module):
         return E
 
     def mix_aero(self, E: torch.Tensor) -> torch.Tensor:
-        logits = self.w_aero_logits(E.reshape(E.shape[0], -1))
+        logits = self.w_aero_logits(E.view(E.shape[0], -1))
         w = torch.softmax(logits, dim=-1)
         return (w.unsqueeze(-1) * E).sum(dim=1)
 
@@ -128,27 +126,32 @@ class WHISP(nn.Module):
         E = self.embed(pairs)
         u = E.mean(dim=1)
         tau = max(float(route_tau), 1e-3)
+        inv_tau = 1.0 / tau
 
-        aux: dict[str, torch.Tensor] = {"L_ns_list": []}
+        aux: dict[str, torch.Tensor] = {}
+        l_ns_acc: torch.Tensor | None = None
         for k, stage in enumerate(self.stages):
             E = stage.run_inner(E, u, route_tau=tau)
             a = stage.mix_aero(E)
             logits = (E * a.unsqueeze(1)).sum(dim=-1)
-            scores = torch.softmax(logits / tau, dim=-1)
+            scores = torch.softmax(logits * inv_tau, dim=-1)
             raw_delta = (scores.unsqueeze(-1) * E).sum(dim=1)
 
             L_ns, cl_gamma = self.pre_physics(raw_delta)
-            aux["L_ns_list"].append(L_ns)
+            l_ns_acc = L_ns if l_ns_acc is None else l_ns_acc + L_ns
             aux[f"cl_gamma_{k}"] = cl_gamma
 
             du = self.delta_transformer(raw_delta)
             damp = float(self.delta_damping.item())
             u = raw_delta + damp * du
 
-            B, four, d_ = E.shape
-            E = self.post_stage_ln(E.reshape(-1, d_)).reshape(B, four, d_)
+            B = E.shape[0]
+            E = self.post_stage_ln(E.contiguous().view(-1, self.d)).view(B, self.n_emb, self.d)
 
-        logits_out = self.w_out_logits(E.reshape(E.shape[0], -1))
+        assert l_ns_acc is not None
+        aux["L_ns"] = l_ns_acc.mean() / self.n_outer
+
+        logits_out = self.w_out_logits(E.view(E.shape[0], -1))
         w_out = torch.softmax(logits_out, dim=-1)
         a_final = (w_out.unsqueeze(-1) * E).sum(dim=1)
         a_final = self.final_norm(a_final)

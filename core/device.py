@@ -30,3 +30,9 @@ def configure_cuda_training(device: torch.device, *, deterministic: bool = False
     else:
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
+
+    # CUDA-style knobs are also honored by ROCm builds.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+    if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+        torch.backends.cuda.enable_flash_sdp(True)
