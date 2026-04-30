@@ -32,6 +32,7 @@ from scripts.train_whisp import (
     airfoil_row_splits,
     aux_scale_schedule,
     build_lr_scheduler,
+    fluctuation_plateau,
     maybe_compile_model,
     polar_mask_for_rows,
     required_bundle_keys,
@@ -104,6 +105,14 @@ def main() -> None:
     p.add_argument("--aux-ramp-epochs", type=int, default=10, help="Ramp auxiliary losses from 0 to full weight over this many epochs")
     p.add_argument("--early-stop-patience", type=int, default=0, help="Early stop patience (0 disables)")
     p.add_argument("--early-stop-min-delta", type=float, default=1e-4, help="Minimum improvement to reset patience")
+    p.add_argument(
+        "--early-stop-mode",
+        default="delta",
+        choices=["delta", "fluctuation"],
+        help="delta: patience on min-delta improvement, fluctuation: stop when rolling window range is small",
+    )
+    p.add_argument("--early-stop-window", type=int, default=8, help="Window size for fluctuation-based stopping")
+    p.add_argument("--early-stop-fluctuation-tol", type=float, default=1e-4, help="Range tolerance for fluctuation-based stopping")
     p.add_argument(
         "--early-stop-monitor",
         default="val_geo",
@@ -267,7 +276,7 @@ def main() -> None:
     )
     print(
         f"Aux ramp epochs={args.aux_ramp_epochs} | early_stop monitor={args.early_stop_monitor} "
-        f"patience={args.early_stop_patience}"
+        f"patience={args.early_stop_patience} mode={args.early_stop_mode}"
     )
     total_train_steps = max(1, total_train_batches * max(1, args.epochs))
     lr_scheduler = build_lr_scheduler(
@@ -286,10 +295,12 @@ def main() -> None:
 
     best_monitor = float("inf")
     stale_epochs = 0
+    monitor_hist: list[float] = []
     stage = "geo"
     cycle_idx = 0
     stage_best = float("inf")
     stage_stale = 0
+    stage_monitor_hist: list[float] = []
     if args.two_stage:
         set_two_stage_trainable(model_base, stage)
         opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
@@ -372,18 +383,27 @@ def main() -> None:
             f"val_loss={v_loss:.5e} val_geo_mae={v_geo:.5e} lr={opt.param_groups[0]['lr']:.3e}"
         )
         monitor_val = v_geo if args.early_stop_monitor == "val_geo" else v_loss
+        monitor_hist.append(float(monitor_val))
         if monitor_val < (best_monitor - args.early_stop_min_delta):
             best_monitor = monitor_val
             stale_epochs = 0
         else:
             stale_epochs += 1
         if args.two_stage:
+            stage_monitor_hist.append(float(monitor_val))
             if monitor_val < (stage_best - args.early_stop_min_delta):
                 stage_best = monitor_val
                 stage_stale = 0
             else:
                 stage_stale += 1
-            if args.early_stop_patience > 0 and stage_stale >= args.early_stop_patience:
+            stage_should_switch = False
+            if args.early_stop_mode == "fluctuation":
+                stage_should_switch = fluctuation_plateau(
+                    stage_monitor_hist, args.early_stop_window, args.early_stop_fluctuation_tol
+                )
+            elif args.early_stop_patience > 0 and stage_stale >= args.early_stop_patience:
+                stage_should_switch = True
+            if stage_should_switch:
                 if stage == "geo":
                     stage = "aux"
                     print(f"[two-stage] stage-early-stop -> switch to aux at epoch {ep + 1}")
@@ -396,6 +416,7 @@ def main() -> None:
                     print(f"[two-stage] stage-early-stop -> switch to geo at epoch {ep + 1} (cycle {cycle_idx + 1}/{args.stage_cycles})")
                 stage_best = float("inf")
                 stage_stale = 0
+                stage_monitor_hist = []
                 set_two_stage_trainable(model_base, stage)
                 opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
                 lr_scheduler = build_lr_scheduler(
@@ -406,12 +427,24 @@ def main() -> None:
                     min_factor=args.lr_min_factor,
                 )
                 continue
-        elif args.early_stop_patience > 0 and stale_epochs >= args.early_stop_patience:
-            print(
-                f"Early stopping at epoch {ep + 1}: {args.early_stop_monitor} did not improve by "
-                f"{args.early_stop_min_delta:g} for {args.early_stop_patience} epoch(s)."
-            )
-            break
+        else:
+            should_stop = False
+            if args.early_stop_mode == "fluctuation":
+                should_stop = fluctuation_plateau(monitor_hist, args.early_stop_window, args.early_stop_fluctuation_tol)
+            elif args.early_stop_patience > 0 and stale_epochs >= args.early_stop_patience:
+                should_stop = True
+            if should_stop:
+                if args.early_stop_mode == "fluctuation":
+                    print(
+                        f"Early stopping at epoch {ep + 1}: {args.early_stop_monitor} fluctuated within "
+                        f"{args.early_stop_fluctuation_tol:g} for {args.early_stop_window} epoch(s)."
+                    )
+                else:
+                    print(
+                        f"Early stopping at epoch {ep + 1}: {args.early_stop_monitor} did not improve by "
+                        f"{args.early_stop_min_delta:g} for {args.early_stop_patience} epoch(s)."
+                    )
+                break
 
     meta = {
         "run_id": run_key,

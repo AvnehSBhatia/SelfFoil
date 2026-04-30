@@ -125,7 +125,18 @@ for rid in "${IDS[@]}"; do
   cat="${rid%%/*}"
   slug="${rid#*/}"
   mkdir -p "${SUITE}/runs/${cat}/${slug}"
-  "${TRAIN[@]}" --run-id "${rid}"
+  RUN_ARGS=("${TRAIN[@]}")
+  # Two-stage geo<->aux switching is not meaningful when physics is fully disabled.
+  if [[ "${TWO_STAGE}" == "1" && "${rid}" == */no_physics ]]; then
+    FILTERED=()
+    for arg in "${RUN_ARGS[@]}"; do
+      if [[ "${arg}" != "--two-stage" ]]; then
+        FILTERED+=("${arg}")
+      fi
+    done
+    RUN_ARGS=("${FILTERED[@]}")
+  fi
+  "${RUN_ARGS[@]}" --run-id "${rid}"
 done
 
 if [[ "${EFF}" == "1" ]]; then
