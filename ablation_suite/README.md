@@ -33,4 +33,4 @@ Legacy baseline names still work:
 python ablation_suite/scripts/train_one.py --model no_physics --device auto
 ```
 
-See `results_summary.md` for metrics, checkpoint layout, and figure names (including per-category bar charts).
+See `results_summary.md` for metrics and checkpoint layout. **All plots** (ablations, `train_whisp`, `train_autoencoders`, `test/eval_autoencoders`, eval scatters) are written under the repo **`figures/`** directory (`core.figures_path.figures_dir()`).

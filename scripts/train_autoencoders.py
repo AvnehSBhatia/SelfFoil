@@ -7,6 +7,10 @@ import argparse
 import sys
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.csv_tensor_cache import load_or_build_cache
+from core.figures_path import figures_dir
 from core.cst_kulfan import CSTDecoder18, CSTEncoder18
 from core.pair_tanh_autoencoder import PairTanhAutoencoder
 
@@ -48,7 +53,7 @@ def train_pair_epochs(
     lr: float,
     batch_points: int,
     out_path: Path,
-) -> None:
+) -> list[float]:
     if mode == "Cl":
         feat = bundle["cl_flat"]
     elif mode == "Cd":
@@ -63,6 +68,7 @@ def train_pair_epochs(
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     p = feat.shape[0]
 
+    curve: list[float] = []
     for ep in range(epochs):
         total = 0.0
         n_batches = 0
@@ -76,11 +82,14 @@ def train_pair_epochs(
             opt.step()
             total += float(loss.detach())
             n_batches += 1
-        print(f"  [{mode}] epoch {ep + 1}/{epochs} mean_batch_mae={total / max(n_batches, 1):.6e}")
+        m = total / max(n_batches, 1)
+        curve.append(m)
+        print(f"  [{mode}] epoch {ep + 1}/{epochs} mean_batch_mae={m:.6e}")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.encoder.state_dict(), out_path)
     print(f"  saved encoder -> {out_path}")
+    return curve
 
 
 def eval_cst_mae_batched(
@@ -146,13 +155,15 @@ def main() -> None:
     bundle = move_bundle_to_device(bundle_cpu, device)
 
     print(f"Training pair tanh autoencoders on {device} (save encoder only, MAE)...")
-    for mode, fname in [
+    modes_fnames = [
         ("Cl", "encoder_cl_alpha.pt"),
         ("Cd", "encoder_cd_alpha.pt"),
         ("mach", "encoder_mach_alpha.pt"),
         ("Re", "encoder_re_alpha.pt"),
-    ]:
-        train_pair_epochs(
+    ]
+    curves: dict[str, list[float]] = {}
+    for mode, fname in modes_fnames:
+        curves[mode] = train_pair_epochs(
             bundle,
             device,
             mode,
@@ -162,14 +173,40 @@ def main() -> None:
             models_dir / fname,
         )
 
+    fd = figures_dir()
+    fig_p, axes_p = plt.subplots(2, 2, figsize=(9, 7), sharex=True)
+    for ax, (mode, _) in zip(axes_p.ravel(), modes_fnames):
+        ep = list(range(1, args.epochs + 1))
+        ax.plot(ep, curves[mode], marker=".", ms=2)
+        ax.set_title(f"{mode}+α encoder MAE")
+        ax.set_ylabel("batch MAE")
+    for ax in axes_p[-1, :]:
+        ax.set_xlabel("epoch")
+    fig_p.suptitle("Pair autoencoder training curves")
+    fig_p.tight_layout()
+    fig_p.savefig(fd / "train_autoencoders_pair_mae_curves.png", dpi=220)
+    plt.close(fig_p)
+
     decoder = CSTDecoder18(n_weights_per_side=8, n1=0.5, n2=1.0)
     print(f"CST reconstruction MAE (coord_dim={coord_dim}) on {device}...")
+    cst_mae_curve: list[float] = []
     for ep in range(args.epochs):
         mae = eval_cst_mae_batched(bundle, device, args.batch_rows, coord_dim)
+        cst_mae_curve.append(mae)
         print(f"  [CST] pass {ep + 1}/{args.epochs} mean_batch_mae={mae:.6e}")
+
+    fig_c, ax_c = plt.subplots(figsize=(8, 4))
+    ax_c.plot(range(1, args.epochs + 1), cst_mae_curve, marker=".", color="C2")
+    ax_c.set_xlabel("pass")
+    ax_c.set_ylabel("mean batch MAE (coords)")
+    ax_c.set_title("CST encoder/decoder coordinate reconstruction (batched MAE)")
+    fig_c.tight_layout()
+    fig_c.savefig(fd / "train_autoencoders_cst_coord_mae.png", dpi=220)
+    plt.close(fig_c)
 
     save_cst_meta(models_dir / "decoder_coords.pt", decoder)
     print(f"  saved CST meta -> {models_dir / 'decoder_coords.pt'}")
+    print(f"Saved figures under {fd}")
     print("Done.")
 
 

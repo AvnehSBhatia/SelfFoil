@@ -9,6 +9,10 @@ import random
 import sys
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -21,6 +25,7 @@ from ablation_suite.catalog import get_spec
 from ablation_suite.models.registry import resolve_run_key, run_path_parts
 from ablation_suite.models.whisp_ablated import WHISPAblated
 from core.csv_tensor_cache import load_or_build_cache
+from core.figures_path import figures_dir
 from scripts.train_whisp import (
     airfoil_row_splits,
     move_bundle,
@@ -275,6 +280,24 @@ def main() -> None:
             indent=0,
         )
     print(f"Saved checkpoint -> {ckpt_path}")
+
+    fd = figures_dir()
+    safe = f"{cat}__{slug}".replace("/", "_")
+    ep = [h["epoch"] for h in history]
+    fig, axes = plt.subplots(2, 1, figsize=(8, 5.2), sharex=True)
+    axes[0].plot(ep, [h["train_loss"] for h in history], label="train loss")
+    axes[0].plot(ep, [h["val_loss"] for h in history], label="val loss")
+    axes[0].set_ylabel("loss")
+    axes[0].legend(loc="upper right", fontsize=8)
+    axes[0].set_title(f"WHISP ablation train/val — {run_key}")
+    axes[1].plot(ep, [h["val_geo_mae"] for h in history], color="C2", label="val CST MAE")
+    axes[1].set_xlabel("epoch")
+    axes[1].set_ylabel("val geo MAE")
+    axes[1].legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(fd / f"ablation_train_curves_{safe}.png", dpi=220)
+    plt.close(fig)
+    print(f"Saved figure -> {fd / f'ablation_train_curves_{safe}.png'}")
 
 
 if __name__ == "__main__":

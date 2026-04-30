@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from ablation_suite.catalog import VARIANT_CATALOG
+from core.figures_path import figures_dir
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -44,8 +45,7 @@ def main() -> None:
     p.add_argument("--suite-root", type=Path, default=ROOT / "ablation_suite")
     args = p.parse_args()
 
-    fig_dir = args.suite_root / "figures"
-    fig_dir.mkdir(parents=True, exist_ok=True)
+    fig_dir = figures_dir()
     logs = args.suite_root / "logs"
     metrics_path = logs / "metrics.jsonl"
     eff_path = logs / "efficiency.jsonl"
@@ -65,7 +65,7 @@ def main() -> None:
     ax0.set_title("WHISP ablations (all runs)")
     ax0.tick_params(axis="x", labelsize=6)
     fig0.tight_layout()
-    fig0.savefig(fig_dir / "ablation_barplot.png", dpi=300)
+    fig0.savefig(fig_dir / "ablation_suite_barplot_overview.png", dpi=300)
     plt.close(fig0)
 
     # --- Per-category bars ---
@@ -84,7 +84,7 @@ def main() -> None:
         ax.tick_params(axis="x", rotation=30)
         fig.tight_layout()
         safe = cat.replace("/", "_")
-        fig.savefig(fig_dir / f"{safe}_bar.png", dpi=300)
+        fig.savefig(fig_dir / f"ablation_suite_category_{safe}_bar.png", dpi=300)
         plt.close(fig)
 
     # --- Convergence (+ optional efficiency) ---
@@ -121,7 +121,7 @@ def main() -> None:
         ax2b.set_ylabel("CST RMSE")
         ax2b.set_title("Data efficiency")
     fig2.tight_layout()
-    fig2.savefig(fig_dir / "convergence_curves.png", dpi=300)
+    fig2.savefig(fig_dir / "ablation_suite_convergence_curves.png", dpi=300)
     plt.close(fig2)
 
     # --- Error vs size ---
@@ -135,11 +135,33 @@ def main() -> None:
     ax3.set_ylabel("CST RMSE")
     ax3.set_title("Error vs model size")
     fig3.tight_layout()
-    fig3.savefig(fig_dir / "error_vs_model_size.png", dpi=300)
+    fig3.savefig(fig_dir / "ablation_suite_error_vs_model_size.png", dpi=300)
     plt.close(fig3)
 
+    # --- Metric landscape (2D "cluster" view of latest runs) ---
+    xs_c: list[float] = []
+    ys_cl: list[float] = []
+    labels: list[str] = []
+    for k in order:
+        r = latest[k]
+        xs_c.append(float(r["cst_error"]))
+        ce = r.get("cl_error")
+        ys_cl.append(float(ce) if ce is not None else 0.0)
+        labels.append(k.split("/")[-1])
+    if xs_c:
+        fig4, ax4 = plt.subplots(figsize=(7, 5.5))
+        ax4.scatter(xs_c, ys_cl, s=42, alpha=0.75, c=np.arange(len(xs_c)), cmap="tab20")
+        for i, lab in enumerate(labels):
+            ax4.annotate(lab, (xs_c[i], ys_cl[i]), fontsize=6, xytext=(3, 2), textcoords="offset points")
+        ax4.set_xlabel("CST RMSE (validation)")
+        ax4.set_ylabel("Cl MSE (or 0 if n/a)")
+        ax4.set_title("Ablation metric landscape (latest eval)")
+        fig4.tight_layout()
+        fig4.savefig(fig_dir / "ablation_suite_metric_landscape.png", dpi=300)
+        plt.close(fig4)
+
     # --- Manifest (counts) ---
-    with open(fig_dir / "suite_manifest.txt", "w", encoding="utf-8") as f:
+    with open(fig_dir / "ablation_suite_manifest.txt", "w", encoding="utf-8") as f:
         f.write(f"catalog_runs={len(VARIANT_CATALOG)} evaluated={len(latest)}\n")
 
     print(f"Wrote figures under {fig_dir}")

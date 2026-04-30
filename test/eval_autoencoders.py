@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.csv_tensor_cache import load_or_build_cache
+from core.figures_path import figures_dir
 from core.cst_kulfan import CSTDecoder18, CSTEncoder18
 from core.pair_tanh_autoencoder import PairTanhAutoencoder
 
@@ -72,8 +73,7 @@ def main() -> None:
 
     device = resolve_device(args.device)
     models_dir = ROOT / "models"
-    fig_dir = ROOT / "test" / "figures"
-    fig_dir.mkdir(parents=True, exist_ok=True)
+    fig_dir = figures_dir()
 
     bundle_cpu = load_or_build_cache(
         args.csv,
@@ -84,6 +84,7 @@ def main() -> None:
     bundle = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in bundle_cpu.items()}
     coord_dim = int(bundle["coords"].shape[1])
 
+    latent_batches: list[tuple[str, torch.Tensor]] = []
     for mode, fname in [
         ("Cl", "encoder_cl_alpha.pt"),
         ("Cd", "encoder_cd_alpha.pt"),
@@ -95,6 +96,7 @@ def main() -> None:
             print(f"skip {fname}: missing")
             continue
         z = collect_pair_latents(bundle, path, mode, args.max_rows, device)
+        latent_batches.append((mode, z))
         print(f"{mode}: latent shape {tuple(z.shape)} mean_abs={z.abs().mean():.4f}")
         plt.figure(figsize=(5, 4))
         plt.scatter(z[:, 0].numpy(), z[:, 1].numpy(), s=2, alpha=0.35)
@@ -102,10 +104,24 @@ def main() -> None:
         plt.ylabel("latent dim 1")
         plt.title(f"{mode}+AoA encoder (first two dims)")
         plt.tight_layout()
-        out = fig_dir / f"latent_{mode.lower()}_scatter.png"
+        out = fig_dir / f"eval_autoencoders_latent_{mode.lower()}_scatter.png"
         plt.savefig(out, dpi=120)
         plt.close()
         print(f"  wrote {out}")
+
+    if len(latent_batches) == 4:
+        fig, axes = plt.subplots(2, 2, figsize=(8, 8))
+        for ax, (mode, z) in zip(axes.ravel(), latent_batches):
+            ax.scatter(z[:, 0].numpy(), z[:, 1].numpy(), s=1, alpha=0.35)
+            ax.set_title(f"{mode}+α")
+            ax.set_xlabel("z0")
+            ax.set_ylabel("z1")
+        fig.suptitle("Pair encoder latents (dims 0–1)")
+        fig.tight_layout()
+        comb = fig_dir / "eval_autoencoders_latent_grid.png"
+        fig.savefig(comb, dpi=140)
+        plt.close(fig)
+        print(f"  wrote {comb}")
 
     dec_path = models_dir / "decoder_coords.pt"
     if dec_path.is_file():
@@ -135,7 +151,7 @@ def main() -> None:
             if k == 0:
                 plt.legend(fontsize=7, loc="best")
         plt.tight_layout()
-        out = fig_dir / "decoder_coords_samples.png"
+        out = fig_dir / "eval_autoencoders_cst_recon_samples.png"
         plt.savefig(out, dpi=120)
         plt.close()
         print(f"wrote {out}")

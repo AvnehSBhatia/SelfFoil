@@ -8,6 +8,10 @@ import json
 import sys
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 
@@ -17,6 +21,7 @@ if str(ROOT) not in sys.path:
 
 from ablation_suite.models.whisp_ablated import WHISPAblated
 from core.csv_tensor_cache import load_or_build_cache
+from core.figures_path import figures_dir
 from scripts.train_whisp import (
     airfoil_row_splits,
     move_bundle,
@@ -92,6 +97,9 @@ def main() -> None:
     else:
         targets = discover_checkpoints(args.suite_root)
 
+    fd = figures_dir()
+    summary_rows: list[dict[str, object]] = []
+
     for run_key, ckpt_path in targets:
         blob = torch.load(ckpt_path, map_location=device, weights_only=False)
         meta = blob["meta"]
@@ -122,6 +130,13 @@ def main() -> None:
         n_tot = 0
         cd_mean = bundle["cd_flat"][v_idx].mean()
 
+        t_cst0: list[torch.Tensor] = []
+        p_cst0: list[torch.Tensor] = []
+        cl_list: list[torch.Tensor] = []
+        clp_list: list[torch.Tensor] = []
+        max_pts = 5000
+        n_collected = 0
+
         for s in range(0, v_idx.numel(), args.batch):
             sl = v_idx[s : s + args.batch]
             cl = bundle["cl_flat"][sl]
@@ -141,6 +156,13 @@ def main() -> None:
                 sum_cl_mse += float(F.mse_loss(aux[key], cl, reduction="sum").detach())
                 n_cl += sl.numel()
             sum_cd_mse_const += float(((cd - cd_mean) ** 2).sum())
+            if n_collected < max_pts:
+                take = min(sl.numel(), max_pts - n_collected)
+                t_cst0.append(cst_tgt[:take, 0].detach().cpu())
+                p_cst0.append(cst_pred[:take, 0].detach().cpu())
+                cl_list.append(cl[:take].detach().cpu())
+                clp_list.append(aux["cl_direct"][:take].detach().cpu())
+                n_collected += take
 
         cst_error = (sum_cst_l2 / max(1, n_tot)) ** 0.5
         cl_error = (sum_cl_mse / max(1, n_cl)) if n_cl else None
@@ -161,6 +183,55 @@ def main() -> None:
         with open(metrics_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
         print(json.dumps(record))
+        summary_rows.append(record)
+
+        t0 = torch.cat(t_cst0).numpy() if t_cst0 else None
+        p0 = torch.cat(p_cst0).numpy() if p_cst0 else None
+        if t0 is not None and p0 is not None:
+            safe = run_key.replace("/", "__")
+            fig, ax = plt.subplots(figsize=(5.5, 5.5))
+            ax.scatter(t0, p0, s=4, alpha=0.35)
+            lims = [min(t0.min(), p0.min()), max(t0.max(), p0.max())]
+            ax.plot(lims, lims, "k--", lw=0.8, alpha=0.6)
+            ax.set_xlabel("CST target dim 0")
+            ax.set_ylabel("CST pred dim 0")
+            ax.set_title(f"Eval {run_key} (val)")
+            ax.set_aspect("equal", adjustable="box")
+            fig.tight_layout()
+            fig.savefig(fd / f"eval_ablation_{safe}_cst0_scatter.png", dpi=200)
+            plt.close(fig)
+        if cl_list:
+            ctrue = torch.cat(cl_list).numpy()
+            cpred = torch.cat(clp_list).numpy()
+            safe = run_key.replace("/", "__")
+            fig2, ax2 = plt.subplots(figsize=(5.5, 5.5))
+            ax2.scatter(ctrue, cpred, s=4, alpha=0.35)
+            lo = min(ctrue.min(), cpred.min())
+            hi = max(ctrue.max(), cpred.max())
+            ax2.plot([lo, hi], [lo, hi], "k--", lw=0.8, alpha=0.6)
+            ax2.set_xlabel("Cl true")
+            ax2.set_ylabel("Cl direct head")
+            ax2.set_title(f"Eval {run_key} — Cl head")
+            fig2.tight_layout()
+            fig2.savefig(fd / f"eval_ablation_{safe}_cl_scatter.png", dpi=200)
+            plt.close(fig2)
+
+    if summary_rows:
+        figs, axs = plt.subplots(figsize=(8, 5))
+        xs = [float(r["cst_error"]) for r in summary_rows]
+        ys = [float(r["cl_error"]) if r.get("cl_error") is not None else 0.0 for r in summary_rows]
+        labs = [str(r["slug"]) for r in summary_rows]
+        axs.scatter(xs, ys, s=36, alpha=0.75)
+        for i, lb in enumerate(labs):
+            axs.annotate(lb, (xs[i], ys[i]), fontsize=7, xytext=(2, 2), textcoords="offset points")
+        axs.set_xlabel("CST RMSE (this eval batch)")
+        axs.set_ylabel("Cl MSE (or 0)")
+        axs.set_title("Eval batch summary (this invocation)")
+        figs.tight_layout()
+        figs.savefig(fd / "eval_ablation_batch_summary_landscape.png", dpi=200)
+        plt.close(figs)
+
+    print(f"Saved evaluation figures under {fd}")
 
 
 if __name__ == "__main__":

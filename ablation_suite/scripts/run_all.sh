@@ -77,4 +77,4 @@ fi
 python "${SUITE}/scripts/evaluate.py" --suite-root "${SUITE}"
 
 python "${SUITE}/scripts/plot_results.py" --suite-root "${SUITE}"
-echo "Done. Figures: ${SUITE}/figures/ (per-category *_bar.png + overview). Metrics: ${SUITE}/logs/metrics.jsonl"
+echo "Done. All figures: ${REPO}/figures/ | Metrics: ${SUITE}/logs/metrics.jsonl"

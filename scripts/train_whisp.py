@@ -7,6 +7,11 @@ import argparse
 import sys
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -15,6 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.csv_tensor_cache import load_or_build_cache
+from core.figures_path import figures_dir
 from core.whisp_net import WHISP
 
 
@@ -181,6 +187,15 @@ def main() -> None:
     n_trainable = sum(x.numel() for x in model.parameters() if x.requires_grad)
     print(f"WHISP trainable parameters: {n_trainable} (pair encoders frozen)")
 
+    hist_train_loss: list[float] = []
+    hist_val_loss: list[float] = []
+    hist_val_geo: list[float] = []
+    hist_tau: list[float] = []
+    hist_train_geo: list[float] = []
+    hist_train_ns: list[float] = []
+    hist_train_clg: list[float] = []
+    hist_train_cld: list[float] = []
+
     for ep in range(args.epochs):
         tau = route_tau_schedule(ep, args.epochs, args.tau_start, args.tau_end)
         model.train()
@@ -226,6 +241,64 @@ def main() -> None:
             f"[geo={run_parts['geo']:.4e} ns={run_parts['ns']:.4e} clg={run_parts['clg']:.4e} cld={run_parts['cld']:.4e}]  "
             f"val_loss={v_loss:.5e} val_geo_mae={v_geo:.5e}"
         )
+        hist_train_loss.append(run_loss)
+        hist_val_loss.append(v_loss)
+        hist_val_geo.append(v_geo)
+        hist_tau.append(tau)
+        hist_train_geo.append(run_parts["geo"])
+        hist_train_ns.append(run_parts["ns"])
+        hist_train_clg.append(run_parts["clg"])
+        hist_train_cld.append(run_parts["cld"])
+
+    fd = figures_dir()
+    ep_axis = np.arange(1, args.epochs + 1)
+    fig1, ax1 = plt.subplots(figsize=(8, 4.5))
+    ax1.plot(ep_axis, hist_train_loss, label="train loss")
+    ax1.plot(ep_axis, hist_val_loss, label="val loss")
+    ax1.set_xlabel("epoch")
+    ax1.set_ylabel("loss")
+    ax1.legend()
+    ax1.set_title("WHISP training / validation loss")
+    fig1.tight_layout()
+    fig1.savefig(fd / "train_whisp_loss_curves.png", dpi=220)
+    plt.close(fig1)
+
+    fig2, ax2 = plt.subplots(figsize=(8, 4.5))
+    ax2.plot(ep_axis, hist_val_geo, color="C2", label="val CST MAE (geo)")
+    ax2.set_xlabel("epoch")
+    ax2.set_ylabel("MAE")
+    ax2.legend()
+    ax2.set_title("WHISP validation CST error")
+    fig2.tight_layout()
+    fig2.savefig(fd / "train_whisp_val_cst_mae.png", dpi=220)
+    plt.close(fig2)
+
+    fig3, axes = plt.subplots(2, 2, figsize=(9, 7), sharex=True)
+    axes[0, 0].plot(ep_axis, hist_train_geo, color="C0")
+    axes[0, 0].set_ylabel("train geo")
+    axes[0, 1].plot(ep_axis, hist_train_ns, color="C1")
+    axes[0, 1].set_ylabel("train L_ns")
+    axes[1, 0].plot(ep_axis, hist_train_clg, color="C2")
+    axes[1, 0].set_ylabel("train cl_γ MSE")
+    axes[1, 1].plot(ep_axis, hist_train_cld, color="C3")
+    axes[1, 1].set_ylabel("train cl_direct MSE")
+    for ax in axes.ravel():
+        ax.set_xlabel("epoch")
+    fig3.suptitle("WHISP loss components (train batch means)")
+    fig3.tight_layout()
+    fig3.savefig(fd / "train_whisp_loss_components.png", dpi=220)
+    plt.close(fig3)
+
+    fig4, ax4 = plt.subplots(figsize=(8, 3.5))
+    ax4.plot(ep_axis, hist_tau, color="C4", marker=".", ms=3)
+    ax4.set_xlabel("epoch")
+    ax4.set_ylabel("τ (routing softmax temp)")
+    ax4.set_title("WHISP routing temperature schedule")
+    fig4.tight_layout()
+    fig4.savefig(fd / "train_whisp_routing_tau.png", dpi=220)
+    plt.close(fig4)
+
+    print(f"Saved figures under {fd}")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
