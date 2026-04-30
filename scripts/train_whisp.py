@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import matplotlib
@@ -90,6 +91,42 @@ def route_tau_schedule(epoch: int, epochs: int, tau_start: float, tau_end: float
     return tau_start + (tau_end - tau_start) * t
 
 
+def maybe_compile_model(model: nn.Module, device: torch.device, enabled: bool, backend: str) -> nn.Module:
+    if not enabled or not hasattr(torch, "compile"):
+        return model
+    if backend == "auto":
+        # ROCm+Inductor can spend minutes in async kernel compilation for this model.
+        # Use AOT eager by default so --compile does not make startup look frozen.
+        backend = "aot_eager" if device.type == "cuda" and getattr(torch.version, "hip", None) is not None else "inductor"
+    try:
+        if backend == "inductor":
+            try:
+                import torch._inductor.config as inductor_config
+
+                inductor_config.max_autotune = False
+            except Exception:
+                pass
+            return torch.compile(model, mode="reduce-overhead")
+        if backend == "none":
+            return model
+        return torch.compile(model, backend=backend)
+    except Exception as e:
+        print(f"[warn] torch.compile setup failed ({e}); falling back to eager.")
+        return model
+
+
+def sync_if_needed(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def train_batch_count(n_items: int, batch: int, max_batches: int | None) -> int:
+    n = (n_items + batch - 1) // batch
+    if max_batches is not None:
+        n = min(n, max_batches)
+    return max(1, n)
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--csv", type=Path, default=ROOT / "data" / "original.csv")
@@ -115,6 +152,16 @@ def main() -> None:
     p.add_argument("--enc-re", type=Path, default=None)
     p.add_argument("--enc-mach", type=Path, default=None)
     p.add_argument("--compile", action="store_true", help="Compile model with torch.compile for faster training")
+    p.add_argument(
+        "--compile-backend",
+        default="auto",
+        choices=["auto", "inductor", "aot_eager", "eager", "none"],
+        help="torch.compile backend; auto avoids slow ROCm Inductor startup",
+    )
+    p.add_argument("--warmup", action="store_true", help="Run one no-grad warmup batch before training")
+    p.add_argument("--log-every", type=int, default=100, help="Print progress every N train batches (0 disables)")
+    p.add_argument("--max-train-batches", type=int, default=None, help="Cap train batches per epoch for quick CUDA checks")
+    p.add_argument("--max-val-batches", type=int, default=None, help="Cap validation batches per epoch for quick CUDA checks")
     args = p.parse_args()
 
     device = resolve_device(args.device)
@@ -153,7 +200,7 @@ def main() -> None:
         raise SystemExit("Empty train or val polar split; adjust fractions or dataset size.")
 
     model_base = WHISP(encoder_ckpts=encoder_ckpts).to(device)
-    model = torch.compile(model_base) if args.compile and hasattr(torch, "compile") else model_base
+    model = maybe_compile_model(model_base, device, enabled=args.compile, backend=args.compile_backend)
     opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
     last_k = model_base.n_outer - 1
 
@@ -183,9 +230,17 @@ def main() -> None:
     print(f"Device={device} | train polar={train_idx.numel()} val polar={val_idx.numel()} | rows={n_rows}")
     n_trainable = sum(x.numel() for x in model_base.parameters() if x.requires_grad)
     print(f"WHISP trainable parameters: {n_trainable} (pair encoders frozen)")
-    with torch.no_grad():
-        warm_idx = train_idx[: min(args.batch, train_idx.numel())]
-        _ = forward_losses(warm_idx, args.tau_start)
+    total_train_batches = train_batch_count(train_idx.numel(), args.batch, args.max_train_batches)
+    total_val_batches = train_batch_count(val_idx.numel(), args.batch, args.max_val_batches)
+    print(
+        f"Batch={args.batch} | train_batches/epoch={total_train_batches} "
+        f"val_batches/epoch={total_val_batches} | compile_backend={args.compile_backend if args.compile else 'off'}"
+    )
+    if args.warmup:
+        with torch.no_grad():
+            warm_idx = train_idx[: min(args.batch, train_idx.numel())]
+            _ = forward_losses(warm_idx, args.tau_start)
+            sync_if_needed(device)
 
     hist_train_loss: list[float] = []
     hist_val_loss: list[float] = []
@@ -209,7 +264,10 @@ def main() -> None:
             "cld": torch.zeros((), device=device, dtype=torch.float32),
         }
         n_batches = 0
+        t_epoch = time.perf_counter()
         for s in range(0, perm.numel(), args.batch):
+            if args.max_train_batches is not None and n_batches >= args.max_train_batches:
+                break
             sl = perm[s : s + args.batch]
             opt.zero_grad(set_to_none=True)
             loss, parts = forward_losses(sl, tau)
@@ -222,18 +280,29 @@ def main() -> None:
             run_parts["clg"] = run_parts["clg"] + parts["clg"].detach()
             run_parts["cld"] = run_parts["cld"] + parts["cld"].detach()
             n_batches += 1
+            if args.log_every > 0 and (n_batches == 1 or n_batches % args.log_every == 0):
+                sync_if_needed(device)
+                elapsed = time.perf_counter() - t_epoch
+                batches_per_s = n_batches / max(elapsed, 1e-9)
+                print(
+                    f"  train batch {n_batches}/{total_train_batches} "
+                    f"({batches_per_s:.2f} batch/s, loss={loss.detach().item():.4e})",
+                    flush=True,
+                )
 
         model.eval()
         val_tau = args.tau_end
         with torch.no_grad():
             v_loss = torch.zeros((), device=device, dtype=torch.float32)
             v_geo = torch.zeros((), device=device, dtype=torch.float32)
-            for s in range(0, val_idx.numel(), args.batch):
+            for vi, s in enumerate(range(0, val_idx.numel(), args.batch)):
+                if args.max_val_batches is not None and vi >= args.max_val_batches:
+                    break
                 sl = val_idx[s : s + args.batch]
                 lf, parts = forward_losses(sl, val_tau)
                 v_loss = v_loss + lf.detach()
                 v_geo = v_geo + parts["geo"].detach()
-            v_n = max(1, (val_idx.numel() + args.batch - 1) // args.batch)
+            v_n = total_val_batches
             v_loss = (v_loss / v_n).item()
             v_geo = (v_geo / v_n).item()
 
@@ -313,7 +382,7 @@ def main() -> None:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "model": model.state_dict(),
+            "model": model_base.state_dict(),
             "meta": {
                 "n_outer": model_base.n_outer,
                 "n_inner": model_base.stages[0].n_inner,

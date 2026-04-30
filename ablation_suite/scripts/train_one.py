@@ -7,6 +7,7 @@ import argparse
 import json
 import random
 import sys
+import time
 from pathlib import Path
 
 import matplotlib
@@ -29,8 +30,11 @@ from core.device import configure_cuda_training, resolve_device
 from core.figures_path import figures_dir
 from scripts.train_whisp import (
     airfoil_row_splits,
+    maybe_compile_model,
     polar_mask_for_rows,
     required_bundle_keys,
+    sync_if_needed,
+    train_batch_count,
 )
 
 
@@ -83,6 +87,16 @@ def main() -> None:
     p.add_argument("--deterministic", action="store_true")
     p.add_argument("--suite-root", type=Path, default=ROOT / "ablation_suite")
     p.add_argument("--compile", action="store_true", help="Compile model with torch.compile for faster training")
+    p.add_argument(
+        "--compile-backend",
+        default="auto",
+        choices=["auto", "inductor", "aot_eager", "eager", "none"],
+        help="torch.compile backend; auto avoids slow ROCm Inductor startup",
+    )
+    p.add_argument("--warmup", action="store_true", help="Run one no-grad warmup batch before training")
+    p.add_argument("--log-every", type=int, default=100, help="Print progress every N train batches (0 disables)")
+    p.add_argument("--max-train-batches", type=int, default=None, help="Cap train batches per epoch for quick CUDA checks")
+    p.add_argument("--max-val-batches", type=int, default=None, help="Cap validation batches per epoch for quick CUDA checks")
     args = p.parse_args()
 
     set_seed(args.seed, args.deterministic)
@@ -141,7 +155,7 @@ def main() -> None:
         train_idx = train_idx[torch.arange(train_idx.numel()) % stride == 0]
 
     model_base = WHISPAblated(encoder_ckpts, spec).to(device)
-    model = torch.compile(model_base) if args.compile and hasattr(torch, "compile") else model_base
+    model = maybe_compile_model(model_base, device, enabled=args.compile, backend=args.compile_backend)
     opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
     distill_w = float(spec.get("distill_weight", 0.0) or 0.0)
     model_for_meta = model_base
@@ -201,9 +215,17 @@ def main() -> None:
         f"WHISP run={run_key} device={device} train={train_idx.numel()} val={val_idx.numel()} "
         f"trainable={count_trainable(model_for_meta)} loss={loss_profile}"
     )
-    with torch.no_grad():
-        warm_idx = train_idx[: min(args.batch, train_idx.numel())]
-        _ = forward_losses(warm_idx, 0)
+    total_train_batches = train_batch_count(train_idx.numel(), args.batch, args.max_train_batches)
+    total_val_batches = train_batch_count(val_idx.numel(), args.batch, args.max_val_batches)
+    print(
+        f"Batch={args.batch} | train_batches/epoch={total_train_batches} "
+        f"val_batches/epoch={total_val_batches} | compile_backend={args.compile_backend if args.compile else 'off'}"
+    )
+    if args.warmup:
+        with torch.no_grad():
+            warm_idx = train_idx[: min(args.batch, train_idx.numel())]
+            _ = forward_losses(warm_idx, 0)
+            sync_if_needed(device)
 
     for ep in range(args.epochs):
         model.train()
@@ -212,7 +234,10 @@ def main() -> None:
         run_loss = torch.zeros((), device=device, dtype=torch.float32)
         run_geo = torch.zeros((), device=device, dtype=torch.float32)
         n_batches = 0
+        t_epoch = time.perf_counter()
         for s in range(0, perm.numel(), args.batch):
+            if args.max_train_batches is not None and n_batches >= args.max_train_batches:
+                break
             sl = perm[s : s + args.batch]
             opt.zero_grad(set_to_none=True)
             loss, parts = forward_losses(sl, ep)
@@ -221,17 +246,28 @@ def main() -> None:
             run_loss = run_loss + loss.detach()
             run_geo = run_geo + parts["geo"].detach()
             n_batches += 1
+            if args.log_every > 0 and (n_batches == 1 or n_batches % args.log_every == 0):
+                sync_if_needed(device)
+                elapsed = time.perf_counter() - t_epoch
+                batches_per_s = n_batches / max(elapsed, 1e-9)
+                print(
+                    f"  train batch {n_batches}/{total_train_batches} "
+                    f"({batches_per_s:.2f} batch/s, loss={loss.detach().item():.4e})",
+                    flush=True,
+                )
 
         model.eval()
         v_loss = torch.zeros((), device=device, dtype=torch.float32)
         v_geo = torch.zeros((), device=device, dtype=torch.float32)
         with torch.no_grad():
-            for s in range(0, val_idx.numel(), args.batch):
+            for vi, s in enumerate(range(0, val_idx.numel(), args.batch)):
+                if args.max_val_batches is not None and vi >= args.max_val_batches:
+                    break
                 sl = val_idx[s : s + args.batch]
                 lf, parts = forward_losses(sl, ep)
                 v_loss = v_loss + lf.detach()
                 v_geo = v_geo + parts["geo"].detach()
-        v_n = max(1, (val_idx.numel() + args.batch - 1) // args.batch)
+        v_n = total_val_batches
         v_loss = (v_loss / v_n).item()
         v_geo = (v_geo / v_n).item()
         if n_batches:
@@ -275,7 +311,7 @@ def main() -> None:
         "variant": run_key,
     }
     ckpt_path = run_dir / "model.pt"
-    torch.save({"model": model.state_dict(), "meta": meta}, ckpt_path)
+    torch.save({"model": model_for_meta.state_dict(), "meta": meta}, ckpt_path)
     with open(run_dir / "history.json", "w", encoding="utf-8") as f:
         json.dump(history, f, indent=0)
     first_low = next((h["epoch"] for h in history if h["val_geo_mae"] < 0.02), args.epochs)
