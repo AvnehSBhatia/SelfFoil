@@ -138,6 +138,16 @@ def main() -> None:
     train_cfg = dict(spec["train"])
     frac_train = float(train_cfg.get("frac_train") or args.frac_train)
     frac_val = float(train_cfg.get("frac_val") or args.frac_val)
+    
+    # --- FIX: guarantee valid split ---
+    if frac_train + frac_val >= 1.0:
+        # keep train, shrink val to leave at least 5% test
+        frac_val = min(frac_val, 0.95 - frac_train)
+        if frac_val <= 0:
+            # fallback: hard reset to safe defaults
+            frac_train, frac_val = 0.8, 0.1
+    
+        print(f"[fix] Adjusted splits -> train={frac_train}, val={frac_val}, test={1-frac_train-frac_val:.3f}")
     lam_ns = float(train_cfg["lambda_ns"] if train_cfg.get("lambda_ns") is not None else args.lambda_ns)
     lam_cl = float(
         train_cfg["lambda_cl_gamma"] if train_cfg.get("lambda_cl_gamma") is not None else args.lambda_cl_gamma
