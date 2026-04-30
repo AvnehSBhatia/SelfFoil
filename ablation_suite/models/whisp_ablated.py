@@ -36,6 +36,7 @@ DEFAULT_MODEL_FLAGS: dict[str, object] = {
     "distill_weight": 0.0,
     "d": 8,
     "n_emb": 4,
+    "dropout_p": 0.05,
 }
 
 
@@ -57,6 +58,7 @@ class InnerBlockAblated(nn.Module):
         interaction: str = "bilinear",
         shared_B: bool = False,
         routing: str = "softmax",
+        dropout_p: float = 0.05,
     ) -> None:
         super().__init__()
         self.d = d
@@ -71,6 +73,7 @@ class InnerBlockAblated(nn.Module):
             self.B_shared = None
         self.W_proj = nn.Linear(d * d, d)
         self.route = nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, n_emb))
+        self.dropout = nn.Dropout(p=dropout_p)
         if interaction == "linear_concat":
             self.mix_lin = nn.Linear(d + d, d)
         elif interaction == "hadamard":
@@ -93,7 +96,7 @@ class InnerBlockAblated(nn.Module):
             else:
                 assert self.B is not None
                 M = outer + self.B.unsqueeze(0)
-            H = self.W_proj(M.contiguous().view(B, n_emb, d * d))
+            H = self.dropout(self.W_proj(M.contiguous().view(B, n_emb, d * d)))
         elif self.interaction == "linear_concat":
             u_exp = u.unsqueeze(1).expand(B, n_emb, d)
             H = self.mix_lin(torch.cat([E, u_exp], dim=-1))
@@ -108,7 +111,7 @@ class InnerBlockAblated(nn.Module):
             else:
                 assert self.B is not None
                 M = outer + self.B.unsqueeze(0)
-            H = self.W_proj(M.contiguous().view(B, n_emb, d * d))
+            H = self.dropout(self.W_proj(M.contiguous().view(B, n_emb, d * d)))
         elif self.interaction == "no_cross":
             H = self.mix_lin(E * u.unsqueeze(1))
         else:
@@ -139,9 +142,12 @@ class OuterStageAblated(nn.Module):
         interaction: str,
         shared_B: bool,
         routing: str,
+        dropout_p: float,
     ) -> None:
         super().__init__()
-        self.inner = InnerBlockAblated(d, n_emb, interaction=interaction, shared_B=shared_B, routing=routing)
+        self.inner = InnerBlockAblated(
+            d, n_emb, interaction=interaction, shared_B=shared_B, routing=routing, dropout_p=dropout_p
+        )
         self.n_inner = n_inner
         self.w_aero_logits = nn.Linear(n_emb * d, n_emb)
 
@@ -189,6 +195,7 @@ class WHISPAblated(nn.Module):
         self.latent_p_mode = str(m["latent_p_mode"])
         self.p_noise_std = float(m["p_noise_std"])
         self.distill_weight = float(m["distill_weight"])
+        self.dropout_p = float(m.get("dropout_p", 0.05))
         routing = "mean_h" if m.get("routing") == "mean_h" else "softmax"
         interaction = str(m["interaction"])
         shared_b_matrix = bool(m.get("shared_B_matrix", False))
@@ -226,6 +233,7 @@ class WHISPAblated(nn.Module):
                         interaction=interaction,
                         shared_B=shared_b_matrix,
                         routing=routing,
+                        dropout_p=self.dropout_p,
                     )
                 ]
             )
@@ -233,7 +241,13 @@ class WHISPAblated(nn.Module):
             self.stages = nn.ModuleList(
                 [
                     OuterStageAblated(
-                        d, n_emb, self.n_inner, interaction=interaction, shared_B=shared_b_matrix, routing=routing
+                        d,
+                        n_emb,
+                        self.n_inner,
+                        interaction=interaction,
+                        shared_B=shared_b_matrix,
+                        routing=routing,
+                        dropout_p=self.dropout_p,
                     )
                     for _ in range(self.n_outer)
                 ]
@@ -242,6 +256,7 @@ class WHISPAblated(nn.Module):
         self.w_out_logits = nn.Linear(n_emb * d, n_emb)
         self.post_stage_ln = nn.LayerNorm(d)
         self.final_norm = nn.LayerNorm(d)
+        self.final_dropout = nn.Dropout(p=self.dropout_p)
         self.head_cst = nn.Linear(d, 18)
         self.head_cl = nn.Linear(d, 1)
         self.register_buffer("delta_damping", torch.tensor(0.3, dtype=torch.float32))
@@ -348,6 +363,7 @@ class WHISPAblated(nn.Module):
         u_mean_fixed = u
         damp = self.delta_damping_value
         tau = max(float(route_tau), 1e-3)
+        inv_tau = 1.0 / tau
         outer_indices = list(range(self.n_outer))
         if self.outer_order == "reversed":
             outer_indices = outer_indices[::-1]
@@ -384,6 +400,7 @@ class WHISPAblated(nn.Module):
         w_out = torch.softmax(logits_out, dim=-1)
         a_final = (w_out.unsqueeze(-1) * E).sum(dim=1)
         a_final = self.final_norm(a_final)
+        a_final = self.final_dropout(a_final)
         cst_pred = self.head_cst(a_final)
         aux["cl_direct"] = self.head_cl(a_final).squeeze(-1)
         aux["a_final"] = a_final

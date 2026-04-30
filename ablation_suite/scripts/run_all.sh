@@ -58,6 +58,7 @@ COMPILE_BACKEND="${COMPILE_BACKEND:-auto}"
 WARMUP="${WARMUP:-1}"
 LOG_EVERY="${LOG_EVERY:-20}"
 MAX_ROWS="${MAX_ROWS:-}"
+DROPOUT_START="${DROPOUT_START:-0.05}"
 
 mkdir -p "${SUITE}/logs" "${SUITE}/figures"
 
@@ -75,6 +76,7 @@ TRAIN=(
   --early-stop-monitor "${EARLY_STOP_MONITOR}"
   --log-every "${LOG_EVERY}"
   --compile-backend "${COMPILE_BACKEND}"
+  --dropout-start "${DROPOUT_START}"
   --suite-root "${SUITE}"
 )
 if [[ "${COMPILE}" == "1" ]]; then

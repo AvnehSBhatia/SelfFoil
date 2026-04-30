@@ -15,13 +15,14 @@ from .whisp_physics import DeltaTransformer, PreDeltaPhysics
 class InnerBlock(nn.Module):
     """One bilinear + projection + routing residual block (shared 5× per outer stage)."""
 
-    def __init__(self, d: int = 8, n_emb: int = 4) -> None:
+    def __init__(self, d: int = 8, n_emb: int = 4, dropout_p: float = 0.05) -> None:
         super().__init__()
         self.d = d
         self.n_emb = n_emb
         self.B = nn.Parameter(torch.zeros(n_emb, d, d))
         self.W_proj = nn.Linear(d * d, d)
         self.route = nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, n_emb))
+        self.dropout = nn.Dropout(p=dropout_p)
 
     def forward(self, E: torch.Tensor, u: torch.Tensor, route_tau: float = 1.0) -> torch.Tensor:
         # E: (B, 4, 8), u: (B, 8); route_tau > 0 softens softmax (less collapse early in training).
@@ -33,6 +34,7 @@ class InnerBlock(nn.Module):
         outer = E_exp * u_exp
         M = outer + self.B.unsqueeze(0)
         H = self.W_proj(M.contiguous().view(B, n_emb, d * d))
+        H = self.dropout(H)
         inv_tau = 1.0 / tau
         route_logits = self.route(H) * inv_tau
         S = torch.softmax(route_logits, dim=-1)
@@ -43,9 +45,9 @@ class InnerBlock(nn.Module):
 class OuterStage(nn.Module):
     """Θ_k: inner weights + pre-delta embedding mixer for this outer index."""
 
-    def __init__(self, d: int = 8, n_emb: int = 4, n_inner: int = 5) -> None:
+    def __init__(self, d: int = 8, n_emb: int = 4, n_inner: int = 5, dropout_p: float = 0.05) -> None:
         super().__init__()
-        self.inner = InnerBlock(d=d, n_emb=n_emb)
+        self.inner = InnerBlock(d=d, n_emb=n_emb, dropout_p=dropout_p)
         self.n_inner = n_inner
         self.w_aero_logits = nn.Linear(n_emb * d, n_emb)
 
@@ -75,6 +77,7 @@ class WHISP(nn.Module):
         n_inner: int = 5,
         cst_dim: int = 18,
         freeze_encoders: bool = True,
+        dropout_p: float = 0.05,
     ) -> None:
         super().__init__()
         if len(encoder_ckpts) != 4:
@@ -83,10 +86,13 @@ class WHISP(nn.Module):
         self.n_emb = n_emb
         self.n_outer = n_outer
         self.embeds = pretrained_pair_embedders(encoder_ckpts, latent_dim=d, freeze=freeze_encoders)
-        self.stages = nn.ModuleList([OuterStage(d=d, n_emb=n_emb, n_inner=n_inner) for _ in range(n_outer)])
+        self.stages = nn.ModuleList(
+            [OuterStage(d=d, n_emb=n_emb, n_inner=n_inner, dropout_p=dropout_p) for _ in range(n_outer)]
+        )
         self.w_out_logits = nn.Linear(n_emb * d, n_emb)
         self.post_stage_ln = nn.LayerNorm(d)
         self.final_norm = nn.LayerNorm(d)
+        self.final_dropout = nn.Dropout(p=dropout_p)
         self.head_cst = nn.Linear(d, cst_dim)
         self.head_cl = nn.Linear(d, 1)
         self.pre_physics = PreDeltaPhysics(z_dim=d)
@@ -155,6 +161,7 @@ class WHISP(nn.Module):
         w_out = torch.softmax(logits_out, dim=-1)
         a_final = (w_out.unsqueeze(-1) * E).sum(dim=1)
         a_final = self.final_norm(a_final)
+        a_final = self.final_dropout(a_final)
         cst_pred = self.head_cst(a_final)
         aux["cl_direct"] = self.head_cl(a_final).squeeze(-1)
         aux["a_final"] = a_final

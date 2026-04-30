@@ -86,6 +86,7 @@ def main() -> None:
     p.add_argument("--enc-cd", type=Path, default=None)
     p.add_argument("--enc-re", type=Path, default=None)
     p.add_argument("--enc-mach", type=Path, default=None)
+    p.add_argument("--dropout-start", type=float, default=0.05, help="Dropout probability in WHISP blocks/heads")
     p.add_argument("--deterministic", action="store_true")
     p.add_argument("--suite-root", type=Path, default=ROOT / "ablation_suite")
     p.add_argument("--compile", action="store_true", help="Compile model with torch.compile for faster training")
@@ -110,6 +111,10 @@ def main() -> None:
     )
     p.add_argument("--lr-schedule", default="cosine", choices=["none", "cosine", "onecycle"], help="Dynamic LR schedule")
     p.add_argument("--lr-min-factor", type=float, default=0.1, help="Min LR as a fraction of base LR for cosine/onecycle")
+    p.add_argument("--geo-loss", default="huber", choices=["mae", "huber"], help="Geometry loss type")
+    p.add_argument("--huber-delta", type=float, default=0.02, help="Huber delta for geometry loss")
+    p.add_argument("--aux-ema-beta", type=float, default=0.98, help="EMA beta for aux loss normalization")
+    p.add_argument("--aux-norm-eps", type=float, default=1e-6, help="Epsilon for aux loss normalization")
     args = p.parse_args()
 
     set_seed(args.seed, args.deterministic)
@@ -117,6 +122,7 @@ def main() -> None:
     configure_cuda_training(device, deterministic=args.deterministic)
     run_key = resolve_run_key(args.run_id, args.model)
     spec = get_spec(run_key)
+    spec = {**spec, "dropout_p": args.dropout_start}
     train_cfg = dict(spec["train"])
     frac_train = float(train_cfg.get("frac_train") or args.frac_train)
     frac_val = float(train_cfg.get("frac_val") or args.frac_val)
@@ -172,8 +178,15 @@ def main() -> None:
     opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
     distill_w = float(spec.get("distill_weight", 0.0) or 0.0)
     model_for_meta = model_base
+    ema_ns = torch.tensor(1.0, device=device)
+    ema_clg = torch.tensor(1.0, device=device)
+    ema_cld = torch.tensor(1.0, device=device)
+    ema_beta = float(args.aux_ema_beta)
 
-    def forward_losses(idx: torch.Tensor, ep: int, aux_scale: float) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def forward_losses(
+        idx: torch.Tensor, ep: int, aux_scale: float, *, update_ema: bool
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        nonlocal ema_ns, ema_clg, ema_cld
         cl = _fetch_batch(bundle_cpu, idx, "cl_flat", device)
         cd = _fetch_batch(bundle_cpu, idx, "cd_flat", device)
         re_log = _fetch_batch(bundle_cpu, idx, "re_log_flat", device)
@@ -189,7 +202,10 @@ def main() -> None:
         cst_tgt = bundle_cpu["cst18"][row].to(device, non_blocking=True)
 
         cst_pred, aux = model(cl, cd, re_log, mach, alpha)
-        l_geo = (cst_pred - cst_tgt).abs().mean()
+        if args.geo_loss == "huber":
+            l_geo = nn.functional.huber_loss(cst_pred, cst_tgt, delta=args.huber_delta, reduction="mean")
+        else:
+            l_geo = (cst_pred - cst_tgt).abs().mean()
         parts: dict[str, torch.Tensor] = {"geo": l_geo}
         l_ns_mean = aux["L_ns"] if model_for_meta.use_physics else torch.tensor(0.0, device=device)
         parts["ns"] = l_ns_mean
@@ -198,8 +214,16 @@ def main() -> None:
         l_cl_g = torch.tensor(0.0, device=device)
         if f"cl_gamma_{last_k}" in aux:
             l_cl_g = nn.functional.mse_loss(aux[f"cl_gamma_{last_k}"], cl)
+        if update_ema:
+            ema_ns = ema_beta * ema_ns + (1.0 - ema_beta) * l_ns_mean.detach()
+            ema_clg = ema_beta * ema_clg + (1.0 - ema_beta) * l_cl_g.detach()
         parts["clg"] = l_cl_g
         l_cl_head = nn.functional.mse_loss(aux["cl_direct"], cl)
+        if update_ema:
+            ema_cld = ema_beta * ema_cld + (1.0 - ema_beta) * l_cl_head.detach()
+        l_ns_norm = l_ns_mean / (ema_ns.detach() + args.aux_norm_eps)
+        l_cl_g_norm = l_cl_g / (ema_clg.detach() + args.aux_norm_eps)
+        l_cl_head_norm = l_cl_head / (ema_cld.detach() + args.aux_norm_eps)
 
         t = 1.0 - ep / max(1, args.epochs - 1) if anneal and args.epochs > 1 else 1.0
         lam_ns_ep = lam_ns * t
@@ -208,13 +232,17 @@ def main() -> None:
         if loss_profile == "geo_only":
             loss = l_geo
         elif loss_profile == "aero_only":
-            loss = l_cl_g if model_for_meta.use_physics and f"cl_gamma_{last_k}" in aux else l_cl_head
+            loss = l_cl_g_norm if model_for_meta.use_physics and f"cl_gamma_{last_k}" in aux else l_cl_head_norm
         elif loss_profile == "no_geo":
-            loss = aux_scale * lam_ns_ep * l_ns_mean + aux_scale * lam_cl_ep * l_cl_g if model_for_meta.use_physics else l_cl_head
+            loss = (
+                aux_scale * lam_ns_ep * l_ns_norm + aux_scale * lam_cl_ep * l_cl_g_norm
+                if model_for_meta.use_physics
+                else l_cl_head_norm
+            )
         else:
             loss = l_geo
             if model_for_meta.use_physics:
-                loss = loss + aux_scale * lam_ns_ep * l_ns_mean + aux_scale * lam_cl_ep * l_cl_g
+                loss = loss + aux_scale * lam_ns_ep * l_ns_norm + aux_scale * lam_cl_ep * l_cl_g_norm
         if distill_w > 0.0 and "embed_distill" in aux:
             loss = loss + distill_w * aux["embed_distill"]
         return loss, parts
@@ -250,7 +278,7 @@ def main() -> None:
     if args.warmup:
         with torch.no_grad():
             warm_idx = train_idx[: min(args.batch, train_idx.numel())]
-            _ = forward_losses(warm_idx, 0, aux_scale=1.0)
+            _ = forward_losses(warm_idx, 0, aux_scale=1.0, update_ema=False)
             sync_if_needed(device)
 
     best_monitor = float("inf")
@@ -270,7 +298,7 @@ def main() -> None:
                 break
             sl = perm[s : s + args.batch]
             opt.zero_grad(set_to_none=True)
-            loss, parts = forward_losses(sl, ep, aux_scale=aux_scale)
+            loss, parts = forward_losses(sl, ep, aux_scale=aux_scale, update_ema=True)
             loss.backward()
             opt.step()
             if lr_scheduler is not None:
@@ -296,7 +324,7 @@ def main() -> None:
                 if args.max_val_batches is not None and vi >= args.max_val_batches:
                     break
                 sl = val_idx[s : s + args.batch]
-                lf, parts = forward_losses(sl, ep, aux_scale=aux_scale)
+                lf, parts = forward_losses(sl, ep, aux_scale=aux_scale, update_ema=False)
                 v_loss = v_loss + lf.detach()
                 v_geo = v_geo + parts["geo"].detach()
         v_n = total_val_batches
