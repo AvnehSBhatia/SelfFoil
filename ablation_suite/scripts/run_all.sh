@@ -12,6 +12,35 @@ if [[ -f "${REPO}/.venv/bin/activate" ]]; then
   source "${REPO}/.venv/bin/activate"
 fi
 
+pick_python_with_torch() {
+  local candidates=()
+  if [[ -n "${PYTHON_BIN:-}" ]]; then
+    candidates+=("${PYTHON_BIN}")
+  fi
+  candidates+=(
+    "${REPO}/.venv/bin/python"
+    "/opt/venv/bin/python"
+    "python"
+    "python3"
+  )
+  for py in "${candidates[@]}"; do
+    if command -v "${py}" >/dev/null 2>&1; then
+      if "${py}" -c "import torch" >/dev/null 2>&1; then
+        echo "${py}"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+if ! PYTHON_EXE="$(pick_python_with_torch)"; then
+  echo "ERROR: Could not find a Python interpreter with torch installed."
+  echo "Tried: PYTHON_BIN, ${REPO}/.venv/bin/python, /opt/venv/bin/python, python, python3"
+  exit 1
+fi
+echo "Using Python: ${PYTHON_EXE}"
+
 SUITE="${REPO}/ablation_suite"
 EPOCHS="${EPOCHS:-80}"
 DEVICE="${DEVICE:-cuda}"
@@ -33,7 +62,7 @@ MAX_ROWS="${MAX_ROWS:-}"
 mkdir -p "${SUITE}/logs" "${SUITE}/figures"
 
 TRAIN=(
-  python "${SUITE}/scripts/train_one.py"
+  "${PYTHON_EXE}" "${SUITE}/scripts/train_one.py"
   --device "${DEVICE}"
   --epochs "${EPOCHS}"
   --batch "${BATCH}"
@@ -57,10 +86,10 @@ fi
 if [[ -n "${MAX_ROWS}" ]]; then
   TRAIN+=(--max-rows "${MAX_ROWS}")
 fi
-EVAL=(python "${SUITE}/scripts/evaluate.py" --device "${DEVICE}" --suite-root "${SUITE}")
+EVAL=("${PYTHON_EXE}" "${SUITE}/scripts/evaluate.py" --device "${DEVICE}" --suite-root "${SUITE}")
 
 if [[ "${FULL_SUITE:-0}" == "1" ]]; then
-  read -r -a IDS <<< "$(python -c "from ablation_suite.catalog import all_run_ids; print(' '.join(all_run_ids()))")"
+  read -r -a IDS <<< "$("${PYTHON_EXE}" -c "from ablation_suite.catalog import all_run_ids; print(' '.join(all_run_ids()))")"
 else
   IDS=(
     baseline/no_physics
@@ -111,7 +140,7 @@ if [[ -f "${SUITE}/runs/baseline/full/model.pt" ]]; then
 fi
 
 : > "${SUITE}/logs/metrics.jsonl"
-python "${SUITE}/scripts/evaluate.py" --suite-root "${SUITE}"
+"${PYTHON_EXE}" "${SUITE}/scripts/evaluate.py" --suite-root "${SUITE}"
 
-python "${SUITE}/scripts/plot_results.py" --suite-root "${SUITE}"
+"${PYTHON_EXE}" "${SUITE}/scripts/plot_results.py" --suite-root "${SUITE}"
 echo "Done. All figures: ${REPO}/figures/ | Metrics: ${SUITE}/logs/metrics.jsonl"

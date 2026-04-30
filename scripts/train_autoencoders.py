@@ -152,6 +152,7 @@ def main() -> None:
     p.add_argument("--batch-points", type=int, default=131072, help="Polar samples per pair-AE step")
     p.add_argument("--batch-rows", type=int, default=512, help="Airfoil rows per CST MAE batch")
     p.add_argument("--device", default="cuda", choices=["auto", "cpu", "mps", "cuda"])
+    p.add_argument("--run-cst-eval", action="store_true", help="Run optional CST MAE evaluation loop")
     args = p.parse_args()
 
     device = resolve_device(args.device)
@@ -198,21 +199,24 @@ def main() -> None:
     plt.close(fig_p)
 
     decoder = CSTDecoder18(n_weights_per_side=8, n1=0.5, n2=1.0)
-    print(f"CST reconstruction MAE (coord_dim={coord_dim}) on {device}...")
-    cst_mae_curve: list[float] = []
-    for ep in range(args.epochs):
-        mae = eval_cst_mae_batched(bundle, device, args.batch_rows, coord_dim)
-        cst_mae_curve.append(mae)
-        print(f"  [CST] pass {ep + 1}/{args.epochs} mean_batch_mae={mae:.6e}")
+    if args.run_cst_eval:
+        print(f"CST reconstruction MAE (coord_dim={coord_dim}) on {device}...")
+        cst_mae_curve: list[float] = []
+        for ep in range(args.epochs):
+            mae = eval_cst_mae_batched(bundle, device, args.batch_rows, coord_dim)
+            cst_mae_curve.append(mae)
+            print(f"  [CST] pass {ep + 1}/{args.epochs} mean_batch_mae={mae:.6e}")
 
-    fig_c, ax_c = plt.subplots(figsize=(8, 4))
-    ax_c.plot(range(1, args.epochs + 1), cst_mae_curve, marker=".", color="C2")
-    ax_c.set_xlabel("pass")
-    ax_c.set_ylabel("mean batch MAE (coords)")
-    ax_c.set_title("CST encoder/decoder coordinate reconstruction (batched MAE)")
-    fig_c.tight_layout()
-    fig_c.savefig(fd / "train_autoencoders_cst_coord_mae.png", dpi=220)
-    plt.close(fig_c)
+        fig_c, ax_c = plt.subplots(figsize=(8, 4))
+        ax_c.plot(range(1, args.epochs + 1), cst_mae_curve, marker=".", color="C2")
+        ax_c.set_xlabel("pass")
+        ax_c.set_ylabel("mean batch MAE (coords)")
+        ax_c.set_title("CST encoder/decoder coordinate reconstruction (batched MAE)")
+        fig_c.tight_layout()
+        fig_c.savefig(fd / "train_autoencoders_cst_coord_mae.png", dpi=220)
+        plt.close(fig_c)
+    else:
+        print("Skipping CST MAE evaluation pass (use --run-cst-eval to enable).")
 
     save_cst_meta(models_dir / "decoder_coords.pt", decoder)
     print(f"  saved CST meta -> {models_dir / 'decoder_coords.pt'}")
