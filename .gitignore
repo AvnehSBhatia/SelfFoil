@@ -7,3 +7,4 @@ bigfoil/
 *.pkl
 *.csv
 models/original_tensors.pt
+models/test_tensors.pt
