@@ -1,0 +1,6 @@
+{
+"run_id": "interaction/linear_only",
+"epoch": 80,
+"final_val_geo_mae": 0.007691484875977039,
+"convergence_epoch_val_geo_mae_below_0.02": 1
+}

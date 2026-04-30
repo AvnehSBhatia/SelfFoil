@@ -1,0 +1,6 @@
+{
+"run_id": "encoder/finetune",
+"epoch": 80,
+"final_val_geo_mae": 0.0068487063981592655,
+"convergence_epoch_val_geo_mae_below_0.02": 1
+}

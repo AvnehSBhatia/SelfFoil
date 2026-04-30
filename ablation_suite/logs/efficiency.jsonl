@@ -1,0 +1,4 @@
+{"model": "baseline/full", "category": "baseline", "slug": "full", "cst_error": 1.879747, "cl_error": 153.147351, "cd_error": 0.005422, "epoch": 80, "trainable_params": 4021, "frac_train": 0.25}
+{"model": "baseline/full", "category": "baseline", "slug": "full", "cst_error": 1.937886, "cl_error": 138.736678, "cd_error": 0.004998, "epoch": 80, "trainable_params": 647, "frac_train": 0.5}
+{"model": "baseline/full", "category": "baseline", "slug": "full", "cst_error": 1.985539, "cl_error": 165.457554, "cd_error": 0.002801, "epoch": 80, "trainable_params": 647, "frac_train": 0.75}
+{"model": "baseline/full", "category": "baseline", "slug": "full", "cst_error": 2.004673, "cl_error": 152.385581, "cd_error": 0.003265, "epoch": 80, "trainable_params": 647, "frac_train": 0.8}

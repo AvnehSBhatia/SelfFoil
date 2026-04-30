@@ -1,0 +1,6 @@
+{
+"run_id": "physics/no_circulation",
+"epoch": 80,
+"final_val_geo_mae": 0.0071004475466907024,
+"convergence_epoch_val_geo_mae_below_0.02": 1
+}
