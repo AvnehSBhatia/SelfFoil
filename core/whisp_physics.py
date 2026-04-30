@@ -115,8 +115,7 @@ class PreDeltaPhysics(nn.Module):
             perm = self._x_perm.to(device)
             phi = phi[:, perm]
             x = x[perm]
-        dx = float((x[1] - x[0]).item()) if nx > 1 else 1.0
-        mix = float(self.theta_damp_mix.item())
+        mix = self.theta_damp_mix.to(device=device, dtype=dtype)
 
         U_e = self.U_inf + torch.matmul(z, phi)
         U_e = U_e.clamp(min=0.05, max=20.0)
@@ -156,7 +155,7 @@ class PreDeltaPhysics(nn.Module):
             entrain = entrain.clamp(-80.0, 80.0)
             rhs = 0.5 * Cf_k - (2.0 + Hk) * entrain
             rhs = rhs.clamp(-500.0, 500.0)
-            dxk = float((x[k + 1] - x[k]).item()) if k + 1 < nx else dx
+            dxk = x[k + 1] - x[k]
             euler = theta_k + dxk * rhs
             theta_next = (1.0 - mix) * theta_k + mix * euler
             theta_next = theta_next.clamp(1e-6, 0.25)
