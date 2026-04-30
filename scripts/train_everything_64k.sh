@@ -10,6 +10,35 @@ if [[ -f "${REPO}/.venv/bin/activate" ]]; then
   source "${REPO}/.venv/bin/activate"
 fi
 
+pick_python_with_torch() {
+  local candidates=()
+  if [[ -n "${PYTHON_BIN:-}" ]]; then
+    candidates+=("${PYTHON_BIN}")
+  fi
+  candidates+=(
+    "${REPO}/.venv/bin/python"
+    "/opt/venv/bin/python"
+    "python"
+    "python3"
+  )
+  for py in "${candidates[@]}"; do
+    if command -v "${py}" >/dev/null 2>&1; then
+      if "${py}" -c "import torch" >/dev/null 2>&1; then
+        echo "${py}"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+if ! PYTHON_EXE="$(pick_python_with_torch)"; then
+  echo "ERROR: Could not find a Python interpreter with torch installed."
+  echo "Tried: PYTHON_BIN, ${REPO}/.venv/bin/python, /opt/venv/bin/python, python, python3"
+  exit 1
+fi
+echo "Using Python: ${PYTHON_EXE}"
+
 DEVICE="${DEVICE:-cuda}"
 EPOCHS="${EPOCHS:-80}"
 BATCH="${BATCH:-64000}"
@@ -51,14 +80,15 @@ if [[ -n "${MAX_ROWS}" ]]; then
 fi
 
 echo "==> [1/3] Train pair autoencoders (prereq encoders)"
-python scripts/train_autoencoders.py --device "${DEVICE}" ${MAX_ROWS:+--max-rows "${MAX_ROWS}"}
+"${PYTHON_EXE}" scripts/train_autoencoders.py --device "${DEVICE}" ${MAX_ROWS:+--max-rows "${MAX_ROWS}"}
 
 echo "==> [2/3] Train baseline WHISP"
-python scripts/train_whisp.py "${BASE_ARGS[@]}"
+"${PYTHON_EXE}" scripts/train_whisp.py "${BASE_ARGS[@]}"
 
 echo "==> [3/3] Train/evaluate ablation suite"
 export DEVICE EPOCHS BATCH LR LR_SCHEDULE LR_MIN_FACTOR AUX_RAMP_EPOCHS
 export EARLY_STOP_PATIENCE EARLY_STOP_MIN_DELTA EARLY_STOP_MONITOR COMPILE COMPILE_BACKEND WARMUP LOG_EVERY
+export PYTHON_BIN="${PYTHON_EXE}"
 if [[ -n "${MAX_ROWS}" ]]; then
   export MAX_ROWS
 fi
