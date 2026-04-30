@@ -16,10 +16,47 @@ SUITE="${REPO}/ablation_suite"
 EPOCHS="${EPOCHS:-80}"
 DEVICE="${DEVICE:-cuda}"
 EFF="${RUN_DATA_EFFICIENCY:-1}"
+BATCH="${BATCH:-64000}"
+LR="${LR:-3e-4}"
+LR_SCHEDULE="${LR_SCHEDULE:-cosine}"
+LR_MIN_FACTOR="${LR_MIN_FACTOR:-0.1}"
+AUX_RAMP_EPOCHS="${AUX_RAMP_EPOCHS:-10}"
+EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-8}"
+EARLY_STOP_MIN_DELTA="${EARLY_STOP_MIN_DELTA:-5e-4}"
+EARLY_STOP_MONITOR="${EARLY_STOP_MONITOR:-val_geo}"
+COMPILE="${COMPILE:-1}"
+COMPILE_BACKEND="${COMPILE_BACKEND:-auto}"
+WARMUP="${WARMUP:-1}"
+LOG_EVERY="${LOG_EVERY:-20}"
+MAX_ROWS="${MAX_ROWS:-}"
 
 mkdir -p "${SUITE}/logs" "${SUITE}/figures"
 
-TRAIN=(python "${SUITE}/scripts/train_one.py" --device "${DEVICE}" --epochs "${EPOCHS}" --suite-root "${SUITE}")
+TRAIN=(
+  python "${SUITE}/scripts/train_one.py"
+  --device "${DEVICE}"
+  --epochs "${EPOCHS}"
+  --batch "${BATCH}"
+  --lr "${LR}"
+  --lr-schedule "${LR_SCHEDULE}"
+  --lr-min-factor "${LR_MIN_FACTOR}"
+  --aux-ramp-epochs "${AUX_RAMP_EPOCHS}"
+  --early-stop-patience "${EARLY_STOP_PATIENCE}"
+  --early-stop-min-delta "${EARLY_STOP_MIN_DELTA}"
+  --early-stop-monitor "${EARLY_STOP_MONITOR}"
+  --log-every "${LOG_EVERY}"
+  --compile-backend "${COMPILE_BACKEND}"
+  --suite-root "${SUITE}"
+)
+if [[ "${COMPILE}" == "1" ]]; then
+  TRAIN+=(--compile)
+fi
+if [[ "${WARMUP}" == "1" ]]; then
+  TRAIN+=(--warmup)
+fi
+if [[ -n "${MAX_ROWS}" ]]; then
+  TRAIN+=(--max-rows "${MAX_ROWS}")
+fi
 EVAL=(python "${SUITE}/scripts/evaluate.py" --device "${DEVICE}" --suite-root "${SUITE}")
 
 if [[ "${FULL_SUITE:-0}" == "1" ]]; then

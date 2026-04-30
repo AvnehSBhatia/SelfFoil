@@ -30,6 +30,8 @@ from core.device import configure_cuda_training, resolve_device
 from core.figures_path import figures_dir
 from scripts.train_whisp import (
     airfoil_row_splits,
+    aux_scale_schedule,
+    build_lr_scheduler,
     maybe_compile_model,
     polar_mask_for_rows,
     required_bundle_keys,
@@ -97,6 +99,17 @@ def main() -> None:
     p.add_argument("--log-every", type=int, default=100, help="Print progress every N train batches (0 disables)")
     p.add_argument("--max-train-batches", type=int, default=None, help="Cap train batches per epoch for quick CUDA checks")
     p.add_argument("--max-val-batches", type=int, default=None, help="Cap validation batches per epoch for quick CUDA checks")
+    p.add_argument("--aux-ramp-epochs", type=int, default=10, help="Ramp auxiliary losses from 0 to full weight over this many epochs")
+    p.add_argument("--early-stop-patience", type=int, default=0, help="Early stop patience (0 disables)")
+    p.add_argument("--early-stop-min-delta", type=float, default=1e-4, help="Minimum improvement to reset patience")
+    p.add_argument(
+        "--early-stop-monitor",
+        default="val_geo",
+        choices=["val_geo", "val_loss"],
+        help="Metric monitored by early stopping",
+    )
+    p.add_argument("--lr-schedule", default="cosine", choices=["none", "cosine", "onecycle"], help="Dynamic LR schedule")
+    p.add_argument("--lr-min-factor", type=float, default=0.1, help="Min LR as a fraction of base LR for cosine/onecycle")
     args = p.parse_args()
 
     set_seed(args.seed, args.deterministic)
@@ -160,7 +173,7 @@ def main() -> None:
     distill_w = float(spec.get("distill_weight", 0.0) or 0.0)
     model_for_meta = model_base
 
-    def forward_losses(idx: torch.Tensor, ep: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def forward_losses(idx: torch.Tensor, ep: int, aux_scale: float) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         cl = _fetch_batch(bundle_cpu, idx, "cl_flat", device)
         cd = _fetch_batch(bundle_cpu, idx, "cd_flat", device)
         re_log = _fetch_batch(bundle_cpu, idx, "re_log_flat", device)
@@ -197,11 +210,11 @@ def main() -> None:
         elif loss_profile == "aero_only":
             loss = l_cl_g if model_for_meta.use_physics and f"cl_gamma_{last_k}" in aux else l_cl_head
         elif loss_profile == "no_geo":
-            loss = lam_ns_ep * l_ns_mean + lam_cl_ep * l_cl_g if model_for_meta.use_physics else l_cl_head
+            loss = aux_scale * lam_ns_ep * l_ns_mean + aux_scale * lam_cl_ep * l_cl_g if model_for_meta.use_physics else l_cl_head
         else:
             loss = l_geo
             if model_for_meta.use_physics:
-                loss = loss + lam_ns_ep * l_ns_mean + lam_cl_ep * l_cl_g
+                loss = loss + aux_scale * lam_ns_ep * l_ns_mean + aux_scale * lam_cl_ep * l_cl_g
         if distill_w > 0.0 and "embed_distill" in aux:
             loss = loss + distill_w * aux["embed_distill"]
         return loss, parts
@@ -221,13 +234,30 @@ def main() -> None:
         f"Batch={args.batch} | train_batches/epoch={total_train_batches} "
         f"val_batches/epoch={total_val_batches} | compile_backend={args.compile_backend if args.compile else 'off'}"
     )
+    print(
+        f"Aux ramp epochs={args.aux_ramp_epochs} | early_stop monitor={args.early_stop_monitor} "
+        f"patience={args.early_stop_patience}"
+    )
+    total_train_steps = max(1, total_train_batches * max(1, args.epochs))
+    lr_scheduler = build_lr_scheduler(
+        opt,
+        schedule=args.lr_schedule,
+        base_lr=args.lr,
+        total_train_steps=total_train_steps,
+        min_factor=args.lr_min_factor,
+    )
+    print(f"LR schedule={args.lr_schedule} | base_lr={args.lr:.3e}")
     if args.warmup:
         with torch.no_grad():
             warm_idx = train_idx[: min(args.batch, train_idx.numel())]
-            _ = forward_losses(warm_idx, 0)
+            _ = forward_losses(warm_idx, 0, aux_scale=1.0)
             sync_if_needed(device)
 
+    best_monitor = float("inf")
+    stale_epochs = 0
+
     for ep in range(args.epochs):
+        aux_scale = aux_scale_schedule(ep, args.aux_ramp_epochs)
         model.train()
         perm_idx = torch.randperm(train_idx.numel(), device="cpu")
         perm = train_idx[perm_idx]
@@ -240,9 +270,11 @@ def main() -> None:
                 break
             sl = perm[s : s + args.batch]
             opt.zero_grad(set_to_none=True)
-            loss, parts = forward_losses(sl, ep)
+            loss, parts = forward_losses(sl, ep, aux_scale=aux_scale)
             loss.backward()
             opt.step()
+            if lr_scheduler is not None:
+                lr_scheduler.step()
             run_loss = run_loss + loss.detach()
             run_geo = run_geo + parts["geo"].detach()
             n_batches += 1
@@ -264,7 +296,7 @@ def main() -> None:
                 if args.max_val_batches is not None and vi >= args.max_val_batches:
                     break
                 sl = val_idx[s : s + args.batch]
-                lf, parts = forward_losses(sl, ep)
+                lf, parts = forward_losses(sl, ep, aux_scale=aux_scale)
                 v_loss = v_loss + lf.detach()
                 v_geo = v_geo + parts["geo"].detach()
         v_n = total_val_batches
@@ -287,8 +319,21 @@ def main() -> None:
             }
         )
         print(
-            f"epoch {ep + 1}/{args.epochs} train_loss={run_loss:.5e} val_loss={v_loss:.5e} val_geo_mae={v_geo:.5e}"
+            f"epoch {ep + 1}/{args.epochs} aux={aux_scale:.2f} train_loss={run_loss:.5e} "
+            f"val_loss={v_loss:.5e} val_geo_mae={v_geo:.5e} lr={opt.param_groups[0]['lr']:.3e}"
         )
+        monitor_val = v_geo if args.early_stop_monitor == "val_geo" else v_loss
+        if monitor_val < (best_monitor - args.early_stop_min_delta):
+            best_monitor = monitor_val
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+        if args.early_stop_patience > 0 and stale_epochs >= args.early_stop_patience:
+            print(
+                f"Early stopping at epoch {ep + 1}: {args.early_stop_monitor} did not improve by "
+                f"{args.early_stop_min_delta:g} for {args.early_stop_patience} epoch(s)."
+            )
+            break
 
     meta = {
         "run_id": run_key,

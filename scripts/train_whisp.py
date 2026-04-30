@@ -91,6 +91,13 @@ def route_tau_schedule(epoch: int, epochs: int, tau_start: float, tau_end: float
     return tau_start + (tau_end - tau_start) * t
 
 
+def aux_scale_schedule(epoch: int, ramp_epochs: int) -> float:
+    """Geometry-first schedule: aux losses ramp from 0 -> 1 over `ramp_epochs`."""
+    if ramp_epochs <= 0:
+        return 1.0
+    return min(1.0, float(epoch + 1) / float(ramp_epochs))
+
+
 def maybe_compile_model(model: nn.Module, device: torch.device, enabled: bool, backend: str) -> nn.Module:
     if not enabled or not hasattr(torch, "compile"):
         return model
@@ -125,6 +132,32 @@ def train_batch_count(n_items: int, batch: int, max_batches: int | None) -> int:
     if max_batches is not None:
         n = min(n, max_batches)
     return max(1, n)
+
+
+def build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    schedule: str,
+    base_lr: float,
+    total_train_steps: int,
+    min_factor: float,
+) -> torch.optim.lr_scheduler.LRScheduler | None:
+    if schedule == "none":
+        return None
+    if schedule == "cosine":
+        eta_min = base_lr * min_factor
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, total_train_steps), eta_min=eta_min)
+    if schedule == "onecycle":
+        return torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=base_lr,
+            total_steps=max(1, total_train_steps),
+            pct_start=0.1,
+            anneal_strategy="cos",
+            div_factor=10.0,
+            final_div_factor=max(10.0, 1.0 / max(min_factor, 1e-6)),
+        )
+    raise ValueError(f"Unknown lr schedule: {schedule}")
 
 
 def main() -> None:
@@ -162,6 +195,17 @@ def main() -> None:
     p.add_argument("--log-every", type=int, default=100, help="Print progress every N train batches (0 disables)")
     p.add_argument("--max-train-batches", type=int, default=None, help="Cap train batches per epoch for quick CUDA checks")
     p.add_argument("--max-val-batches", type=int, default=None, help="Cap validation batches per epoch for quick CUDA checks")
+    p.add_argument("--aux-ramp-epochs", type=int, default=10, help="Ramp auxiliary losses from 0 to full weight over this many epochs")
+    p.add_argument("--early-stop-patience", type=int, default=0, help="Early stop patience (0 disables)")
+    p.add_argument("--early-stop-min-delta", type=float, default=1e-4, help="Minimum improvement to reset patience")
+    p.add_argument(
+        "--early-stop-monitor",
+        default="val_geo",
+        choices=["val_geo", "val_loss"],
+        help="Metric monitored by early stopping",
+    )
+    p.add_argument("--lr-schedule", default="cosine", choices=["none", "cosine", "onecycle"], help="Dynamic LR schedule")
+    p.add_argument("--lr-min-factor", type=float, default=0.1, help="Min LR as a fraction of base LR for cosine/onecycle")
     args = p.parse_args()
 
     device = resolve_device(args.device)
@@ -204,7 +248,7 @@ def main() -> None:
     opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
     last_k = model_base.n_outer - 1
 
-    def forward_losses(idx: torch.Tensor, route_tau: float) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def forward_losses(idx: torch.Tensor, route_tau: float, aux_scale: float) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         cl = _fetch_batch(bundle_cpu, idx, "cl_flat", device)
         cd = _fetch_batch(bundle_cpu, idx, "cd_flat", device)
         re_log = _fetch_batch(bundle_cpu, idx, "re_log_flat", device)
@@ -220,9 +264,9 @@ def main() -> None:
         l_cl_d = nn.functional.mse_loss(aux["cl_direct"], cl)
         loss = (
             l_geo
-            + args.lambda_ns * l_ns
-            + args.lambda_cl_gamma * l_cl_g
-            + args.lambda_cl_direct * l_cl_d
+            + aux_scale * args.lambda_ns * l_ns
+            + aux_scale * args.lambda_cl_gamma * l_cl_g
+            + aux_scale * args.lambda_cl_direct * l_cl_d
         )
         parts = {"geo": l_geo, "ns": l_ns, "clg": l_cl_g, "cld": l_cl_d}
         return loss, parts
@@ -236,11 +280,27 @@ def main() -> None:
         f"Batch={args.batch} | train_batches/epoch={total_train_batches} "
         f"val_batches/epoch={total_val_batches} | compile_backend={args.compile_backend if args.compile else 'off'}"
     )
+    print(
+        f"Aux ramp epochs={args.aux_ramp_epochs} | early_stop monitor={args.early_stop_monitor} "
+        f"patience={args.early_stop_patience}"
+    )
+    total_train_steps = max(1, total_train_batches * max(1, args.epochs))
+    lr_scheduler = build_lr_scheduler(
+        opt,
+        schedule=args.lr_schedule,
+        base_lr=args.lr,
+        total_train_steps=total_train_steps,
+        min_factor=args.lr_min_factor,
+    )
+    print(f"LR schedule={args.lr_schedule} | base_lr={args.lr:.3e}")
     if args.warmup:
         with torch.no_grad():
             warm_idx = train_idx[: min(args.batch, train_idx.numel())]
-            _ = forward_losses(warm_idx, args.tau_start)
+            _ = forward_losses(warm_idx, args.tau_start, aux_scale=1.0)
             sync_if_needed(device)
+
+    best_monitor = float("inf")
+    stale_epochs = 0
 
     hist_train_loss: list[float] = []
     hist_val_loss: list[float] = []
@@ -253,6 +313,7 @@ def main() -> None:
 
     for ep in range(args.epochs):
         tau = route_tau_schedule(ep, args.epochs, args.tau_start, args.tau_end)
+        aux_scale = aux_scale_schedule(ep, args.aux_ramp_epochs)
         model.train()
         perm_idx = torch.randperm(train_idx.numel(), device="cpu")
         perm = train_idx[perm_idx]
@@ -270,9 +331,11 @@ def main() -> None:
                 break
             sl = perm[s : s + args.batch]
             opt.zero_grad(set_to_none=True)
-            loss, parts = forward_losses(sl, tau)
+            loss, parts = forward_losses(sl, tau, aux_scale=aux_scale)
             loss.backward()
             opt.step()
+            if lr_scheduler is not None:
+                lr_scheduler.step()
 
             run_loss = run_loss + loss.detach()
             run_parts["geo"] = run_parts["geo"] + parts["geo"].detach()
@@ -299,7 +362,7 @@ def main() -> None:
                 if args.max_val_batches is not None and vi >= args.max_val_batches:
                     break
                 sl = val_idx[s : s + args.batch]
-                lf, parts = forward_losses(sl, val_tau)
+                lf, parts = forward_losses(sl, val_tau, aux_scale=aux_scale)
                 v_loss = v_loss + lf.detach()
                 v_geo = v_geo + parts["geo"].detach()
             v_n = total_val_batches
@@ -316,9 +379,9 @@ def main() -> None:
                 run_parts[k] = float(run_parts[k].item())
 
         print(
-            f"epoch {ep + 1}/{args.epochs}  τ={tau:.3f}  train_loss={run_loss:.5e}  "
+            f"epoch {ep + 1}/{args.epochs}  τ={tau:.3f} aux={aux_scale:.2f}  train_loss={run_loss:.5e}  "
             f"[geo={run_parts['geo']:.4e} ns={run_parts['ns']:.4e} clg={run_parts['clg']:.4e} cld={run_parts['cld']:.4e}]  "
-            f"val_loss={v_loss:.5e} val_geo_mae={v_geo:.5e}"
+            f"val_loss={v_loss:.5e} val_geo_mae={v_geo:.5e} lr={opt.param_groups[0]['lr']:.3e}"
         )
         hist_train_loss.append(run_loss)
         hist_val_loss.append(v_loss)
@@ -329,8 +392,21 @@ def main() -> None:
         hist_train_clg.append(run_parts["clg"])
         hist_train_cld.append(run_parts["cld"])
 
+        monitor_val = v_geo if args.early_stop_monitor == "val_geo" else v_loss
+        if monitor_val < (best_monitor - args.early_stop_min_delta):
+            best_monitor = monitor_val
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+        if args.early_stop_patience > 0 and stale_epochs >= args.early_stop_patience:
+            print(
+                f"Early stopping at epoch {ep + 1}: {args.early_stop_monitor} did not improve by "
+                f"{args.early_stop_min_delta:g} for {args.early_stop_patience} epoch(s)."
+            )
+            break
+
     fd = figures_dir()
-    ep_axis = np.arange(1, args.epochs + 1)
+    ep_axis = np.arange(1, len(hist_train_loss) + 1)
     fig1, ax1 = plt.subplots(figsize=(8, 4.5))
     ax1.plot(ep_axis, hist_train_loss, label="train loss")
     ax1.plot(ep_axis, hist_val_loss, label="val loss")
