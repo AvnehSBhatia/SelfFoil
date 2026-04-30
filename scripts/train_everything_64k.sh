@@ -54,6 +54,8 @@ COMPILE_BACKEND="${COMPILE_BACKEND:-auto}"
 WARMUP="${WARMUP:-1}"
 LOG_EVERY="${LOG_EVERY:-20}"
 MAX_ROWS="${MAX_ROWS:-}"
+TWO_STAGE="${TWO_STAGE:-1}"
+STAGE_CYCLES="${STAGE_CYCLES:-2}"
 
 BASE_ARGS=(
   --device "${DEVICE}"
@@ -69,6 +71,9 @@ BASE_ARGS=(
   --log-every "${LOG_EVERY}"
   --compile-backend "${COMPILE_BACKEND}"
 )
+if [[ "${TWO_STAGE}" == "1" ]]; then
+  BASE_ARGS+=(--two-stage --stage-cycles "${STAGE_CYCLES}")
+fi
 if [[ "${COMPILE}" == "1" ]]; then
   BASE_ARGS+=(--compile)
 fi
@@ -89,6 +94,7 @@ echo "==> [3/3] Train/evaluate ablation suite"
 export DEVICE EPOCHS BATCH LR LR_SCHEDULE LR_MIN_FACTOR AUX_RAMP_EPOCHS
 export EARLY_STOP_PATIENCE EARLY_STOP_MIN_DELTA EARLY_STOP_MONITOR COMPILE COMPILE_BACKEND WARMUP LOG_EVERY
 export PYTHON_BIN="${PYTHON_EXE}"
+export TWO_STAGE STAGE_CYCLES
 if [[ -n "${MAX_ROWS}" ]]; then
   export MAX_ROWS
 fi

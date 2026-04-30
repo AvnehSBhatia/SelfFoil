@@ -161,6 +161,38 @@ def build_lr_scheduler(
     raise ValueError(f"Unknown lr schedule: {schedule}")
 
 
+def set_requires_grad_(module: nn.Module, enabled: bool) -> None:
+    for p in module.parameters():
+        p.requires_grad_(enabled)
+
+
+def set_two_stage_trainable(model: WHISP, stage: str) -> None:
+    """Configure trainable params for two-stage training."""
+    if stage == "geo":
+        # Geometry stage: train full geometry path (and direct cl head), keep physics soft.
+        set_requires_grad_(model.stages, True)
+        set_requires_grad_(model.w_out_logits, True)
+        set_requires_grad_(model.post_stage_ln, True)
+        set_requires_grad_(model.final_norm, True)
+        set_requires_grad_(model.head_cst, True)
+        set_requires_grad_(model.head_cl, True)
+        set_requires_grad_(model.pre_physics, True)
+        set_requires_grad_(model.delta_transformer, True)
+        return
+    if stage == "aux":
+        # Aux stage: freeze geometry-producing path, train physics/delta/direct lift only.
+        set_requires_grad_(model.stages, False)
+        set_requires_grad_(model.w_out_logits, False)
+        set_requires_grad_(model.post_stage_ln, False)
+        set_requires_grad_(model.final_norm, False)
+        set_requires_grad_(model.head_cst, False)
+        set_requires_grad_(model.head_cl, True)
+        set_requires_grad_(model.pre_physics, True)
+        set_requires_grad_(model.delta_transformer, True)
+        return
+    raise ValueError(f"Unknown two-stage mode: {stage}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--csv", type=Path, default=ROOT / "data" / "original.csv")
@@ -212,6 +244,10 @@ def main() -> None:
     p.add_argument("--huber-delta", type=float, default=0.02, help="Huber delta for geometry loss")
     p.add_argument("--aux-ema-beta", type=float, default=0.98, help="EMA beta for aux loss normalization")
     p.add_argument("--aux-norm-eps", type=float, default=1e-6, help="Epsilon for aux loss normalization")
+    p.add_argument("--two-stage", action="store_true", help="Enable two-stage training with early-stop-driven stage switching")
+    p.add_argument("--stage-cycles", type=int, default=1, help="Number of geo<->aux cycles in two-stage mode")
+    p.add_argument("--stage1-aux-scale", type=float, default=0.1, help="Aux scale used in geometry stage")
+    p.add_argument("--stage2-aux-scale", type=float, default=1.0, help="Aux scale used in auxiliary stage")
     args = p.parse_args()
 
     device = resolve_device(args.device)
@@ -251,7 +287,6 @@ def main() -> None:
 
     model_base = WHISP(encoder_ckpts=encoder_ckpts, dropout_p=args.dropout_start).to(device)
     model = maybe_compile_model(model_base, device, enabled=args.compile, backend=args.compile_backend)
-    opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
     last_k = model_base.n_outer - 1
     ema_ns = torch.tensor(1.0, device=device)
     ema_clg = torch.tensor(1.0, device=device)
@@ -308,13 +343,6 @@ def main() -> None:
         f"patience={args.early_stop_patience}"
     )
     total_train_steps = max(1, total_train_batches * max(1, args.epochs))
-    lr_scheduler = build_lr_scheduler(
-        opt,
-        schedule=args.lr_schedule,
-        base_lr=args.lr,
-        total_train_steps=total_train_steps,
-        min_factor=args.lr_min_factor,
-    )
     print(f"LR schedule={args.lr_schedule} | base_lr={args.lr:.3e}")
     if args.warmup:
         with torch.no_grad():
@@ -324,6 +352,26 @@ def main() -> None:
 
     best_monitor = float("inf")
     stale_epochs = 0
+
+    stage = "geo"
+    cycle_idx = 0
+    stage_best = float("inf")
+    stage_stale = 0
+    if args.two_stage:
+        set_two_stage_trainable(model_base, stage)
+        print(
+            f"Two-stage enabled: cycles={args.stage_cycles}, stage-switch monitor={args.early_stop_monitor}, "
+            f"patience={args.early_stop_patience}, min_delta={args.early_stop_min_delta:g}"
+        )
+
+    opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
+    lr_scheduler = build_lr_scheduler(
+        opt,
+        schedule=args.lr_schedule,
+        base_lr=args.lr,
+        total_train_steps=total_train_steps,
+        min_factor=args.lr_min_factor,
+    )
 
     hist_train_loss: list[float] = []
     hist_val_loss: list[float] = []
@@ -336,7 +384,10 @@ def main() -> None:
 
     for ep in range(args.epochs):
         tau = route_tau_schedule(ep, args.epochs, args.tau_start, args.tau_end)
-        aux_scale = aux_scale_schedule(ep, args.aux_ramp_epochs)
+        if args.two_stage:
+            aux_scale = args.stage1_aux_scale if stage == "geo" else args.stage2_aux_scale
+        else:
+            aux_scale = aux_scale_schedule(ep, args.aux_ramp_epochs)
         model.train()
         perm_idx = torch.randperm(train_idx.numel(), device="cpu")
         perm = train_idx[perm_idx]
@@ -401,8 +452,9 @@ def main() -> None:
             for k in run_parts:
                 run_parts[k] = float(run_parts[k].item())
 
+        phase_tag = f" stage={stage}" if args.two_stage else ""
         print(
-            f"epoch {ep + 1}/{args.epochs}  τ={tau:.3f} aux={aux_scale:.2f}  train_loss={run_loss:.5e}  "
+            f"epoch {ep + 1}/{args.epochs}{phase_tag}  τ={tau:.3f} aux={aux_scale:.2f}  train_loss={run_loss:.5e}  "
             f"[geo={run_parts['geo']:.4e} ns={run_parts['ns']:.4e} clg={run_parts['clg']:.4e} cld={run_parts['cld']:.4e}]  "
             f"val_loss={v_loss:.5e} val_geo_mae={v_geo:.5e} lr={opt.param_groups[0]['lr']:.3e}"
         )
@@ -421,7 +473,38 @@ def main() -> None:
             stale_epochs = 0
         else:
             stale_epochs += 1
-        if args.early_stop_patience > 0 and stale_epochs >= args.early_stop_patience:
+
+        if args.two_stage:
+            if monitor_val < (stage_best - args.early_stop_min_delta):
+                stage_best = monitor_val
+                stage_stale = 0
+            else:
+                stage_stale += 1
+            if args.early_stop_patience > 0 and stage_stale >= args.early_stop_patience:
+                switched = True
+                if stage == "geo":
+                    stage = "aux"
+                    print(f"[two-stage] stage-early-stop -> switch to aux at epoch {ep + 1}")
+                else:
+                    cycle_idx += 1
+                    if cycle_idx >= args.stage_cycles:
+                        print(f"[two-stage] completed {cycle_idx} cycle(s); stopping.")
+                        break
+                    stage = "geo"
+                    print(f"[two-stage] stage-early-stop -> switch to geo at epoch {ep + 1} (cycle {cycle_idx + 1}/{args.stage_cycles})")
+                stage_best = float("inf")
+                stage_stale = 0
+                set_two_stage_trainable(model_base, stage)
+                opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
+                lr_scheduler = build_lr_scheduler(
+                    opt,
+                    schedule=args.lr_schedule,
+                    base_lr=args.lr,
+                    total_train_steps=max(1, total_train_batches * max(1, args.epochs - ep - 1)),
+                    min_factor=args.lr_min_factor,
+                )
+                continue
+        elif args.early_stop_patience > 0 and stale_epochs >= args.early_stop_patience:
             print(
                 f"Early stopping at epoch {ep + 1}: {args.early_stop_monitor} did not improve by "
                 f"{args.early_stop_min_delta:g} for {args.early_stop_patience} epoch(s)."

@@ -59,6 +59,8 @@ WARMUP="${WARMUP:-1}"
 LOG_EVERY="${LOG_EVERY:-20}"
 MAX_ROWS="${MAX_ROWS:-}"
 DROPOUT_START="${DROPOUT_START:-0.05}"
+TWO_STAGE="${TWO_STAGE:-1}"
+STAGE_CYCLES="${STAGE_CYCLES:-2}"
 
 mkdir -p "${SUITE}/logs" "${SUITE}/figures"
 
@@ -77,8 +79,12 @@ TRAIN=(
   --log-every "${LOG_EVERY}"
   --compile-backend "${COMPILE_BACKEND}"
   --dropout-start "${DROPOUT_START}"
+  --stage-cycles "${STAGE_CYCLES}"
   --suite-root "${SUITE}"
 )
+if [[ "${TWO_STAGE}" == "1" ]]; then
+  TRAIN+=(--two-stage)
+fi
 if [[ "${COMPILE}" == "1" ]]; then
   TRAIN+=(--compile)
 fi

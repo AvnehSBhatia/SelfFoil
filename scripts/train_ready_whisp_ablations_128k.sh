@@ -49,6 +49,8 @@ WARMUP="${WARMUP:-1}"
 LOG_EVERY="${LOG_EVERY:-20}"
 MAX_ROWS="${MAX_ROWS:-}"
 DROPOUT_START="${DROPOUT_START:-0.05}"
+TWO_STAGE="${TWO_STAGE:-1}"
+STAGE_CYCLES="${STAGE_CYCLES:-4}"
 
 BASE_ARGS=(
   --device "${DEVICE}"
@@ -65,6 +67,9 @@ BASE_ARGS=(
   --log-every "${LOG_EVERY}"
   --compile-backend "${COMPILE_BACKEND}"
 )
+if [[ "${TWO_STAGE}" == "1" ]]; then
+  BASE_ARGS+=(--two-stage --stage-cycles "${STAGE_CYCLES}")
+fi
 if [[ "${COMPILE}" == "1" ]]; then
   BASE_ARGS+=(--compile)
 fi
@@ -83,6 +88,7 @@ export PYTHON_BIN="${PYTHON_EXE}"
 export DEVICE EPOCHS BATCH LR LR_SCHEDULE LR_MIN_FACTOR AUX_RAMP_EPOCHS
 export EARLY_STOP_PATIENCE EARLY_STOP_MIN_DELTA EARLY_STOP_MONITOR COMPILE COMPILE_BACKEND WARMUP LOG_EVERY
 export DROPOUT_START
+export TWO_STAGE STAGE_CYCLES
 if [[ -n "${MAX_ROWS}" ]]; then
   export MAX_ROWS
 fi
