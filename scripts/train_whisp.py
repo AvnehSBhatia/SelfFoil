@@ -35,6 +35,10 @@ def move_bundle(bundle: dict, device: torch.device) -> dict:
     return out
 
 
+def _fetch_batch(bundle_cpu: dict, idx: torch.Tensor, key: str, device: torch.device) -> torch.Tensor:
+    return bundle_cpu[key][idx.cpu()].to(device, non_blocking=True)
+
+
 def airfoil_row_splits(n_rows: int, seed: int, frac_train: float, frac_val: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if n_rows < 3:
         raise ValueError("Need at least 3 airfoil rows for train/val/test splits")
@@ -103,7 +107,7 @@ def main() -> None:
     p.add_argument("--frac-train", type=float, default=0.8)
     p.add_argument("--frac-val", type=float, default=0.1)
     p.add_argument("--max-rows", type=int, default=None)
-    p.add_argument("--device", default="cuda", choices=["auto", "cpu", "mps", "cuda"])
+    p.add_argument("--device", default="mps", choices=["auto", "cpu", "mps", "cuda"])
     p.add_argument("--out", type=Path, default=ROOT / "models" / "whisp.pt")
     p.add_argument("--models-dir", type=Path, default=ROOT / "models", help="Directory with encoder_*.pt from train_autoencoders")
     p.add_argument("--enc-cl", type=Path, default=None)
@@ -139,13 +143,14 @@ def main() -> None:
 
     n_rows = int(bundle_cpu["n_rows"])
     train_rows, val_rows, test_rows = airfoil_row_splits(n_rows, args.seed, args.frac_train, args.frac_val)
-    bundle = move_bundle(bundle_cpu, device)
 
-    polar_row = bundle["polar_row_idx"]
-    train_mask = polar_mask_for_rows(polar_row, train_rows)
-    val_mask = polar_mask_for_rows(polar_row, val_rows)
+    polar_row_cpu = bundle_cpu["polar_row_idx"]
+    train_mask = polar_mask_for_rows(polar_row_cpu, train_rows)
+    val_mask = polar_mask_for_rows(polar_row_cpu, val_rows)
     train_idx = torch.nonzero(train_mask, as_tuple=False).squeeze(-1)
     val_idx = torch.nonzero(val_mask, as_tuple=False).squeeze(-1)
+    train_idx_device = train_idx.to(device, non_blocking=True)
+    val_idx_device = val_idx.to(device, non_blocking=True)
     if train_idx.numel() == 0 or val_idx.numel() == 0:
         raise SystemExit("Empty train or val polar split; adjust fractions or dataset size.")
 
@@ -155,13 +160,13 @@ def main() -> None:
     last_k = model_base.n_outer - 1
 
     def forward_losses(idx: torch.Tensor, route_tau: float) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        cl = bundle["cl_flat"][idx]
-        cd = bundle["cd_flat"][idx]
-        re_log = bundle["re_log_flat"][idx]
-        mach = bundle["mach_flat"][idx]
-        alpha = bundle["alpha_flat"][idx]
-        row = polar_row[idx]
-        cst_tgt = bundle["cst18"][row]
+        cl = _fetch_batch(bundle_cpu, idx, "cl_flat", device)
+        cd = _fetch_batch(bundle_cpu, idx, "cd_flat", device)
+        re_log = _fetch_batch(bundle_cpu, idx, "re_log_flat", device)
+        mach = _fetch_batch(bundle_cpu, idx, "mach_flat", device)
+        alpha = _fetch_batch(bundle_cpu, idx, "alpha_flat", device)
+        row = bundle_cpu["polar_row_idx"][idx.cpu()]
+        cst_tgt = bundle_cpu["cst18"][row].to(device, non_blocking=True)
 
         cst_pred, aux = model(cl, cd, re_log, mach, alpha, route_tau=route_tau)
         l_geo = (cst_pred - cst_tgt).abs().mean()
@@ -194,7 +199,7 @@ def main() -> None:
         tau = route_tau_schedule(ep, args.epochs, args.tau_start, args.tau_end)
         model.train()
         perm_idx = torch.randperm(train_idx.numel(), device="cpu")
-        perm = train_idx[perm_idx.to(train_idx.device, non_blocking=True)]
+        perm = train_idx_device[perm_idx.to(device, non_blocking=True)]
         run_loss = torch.zeros((), device=device, dtype=torch.float32)
         run_parts: dict[str, torch.Tensor] = {
             "geo": torch.zeros((), device=device, dtype=torch.float32),
@@ -222,12 +227,12 @@ def main() -> None:
         with torch.no_grad():
             v_loss = torch.zeros((), device=device, dtype=torch.float32)
             v_geo = torch.zeros((), device=device, dtype=torch.float32)
-            for s in range(0, val_idx.numel(), args.batch):
-                sl = val_idx[s : s + args.batch]
+            for s in range(0, val_idx_device.numel(), args.batch):
+                sl = val_idx_device[s : s + args.batch]
                 lf, parts = forward_losses(sl, val_tau)
                 v_loss = v_loss + lf.detach()
                 v_geo = v_geo + parts["geo"].detach()
-            v_n = max(1, (val_idx.numel() + args.batch - 1) // args.batch)
+            v_n = max(1, (val_idx_device.numel() + args.batch - 1) // args.batch)
             v_loss = (v_loss / v_n).item()
             v_geo = (v_geo / v_n).item()
 

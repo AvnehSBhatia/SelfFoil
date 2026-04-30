@@ -28,6 +28,12 @@ def mae_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return (pred - target).abs().mean()
 
 
+def _standardize_1d(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    mean = x.mean()
+    std = x.std(unbiased=False).clamp_min(1e-6)
+    return (x - mean) / std, mean, std
+
+
 def move_bundle_to_device(bundle: dict, device: torch.device) -> dict:
     out = {}
     for k, v in bundle.items():
@@ -56,6 +62,8 @@ def train_pair_epochs(
     else:
         feat = bundle["re_log_flat"]
     aoa = bundle["alpha_flat"]
+    feat_norm, feat_mean, feat_std = _standardize_1d(feat)
+    aoa_norm, aoa_mean, aoa_std = _standardize_1d(aoa)
 
     model = PairTanhAutoencoder(latent_dim=8).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
@@ -67,7 +75,7 @@ def train_pair_epochs(
         n_batches = 0
         for s in range(0, p, batch_points):
             e = min(s + batch_points, p)
-            x = torch.stack([feat[s:e], aoa[s:e]], dim=1)
+            x = torch.stack([feat_norm[s:e], aoa_norm[s:e]], dim=1)
             opt.zero_grad(set_to_none=True)
             recon, _ = model(x)
             loss = mae_loss(recon, x)
@@ -80,7 +88,15 @@ def train_pair_epochs(
         print(f"  [{mode}] epoch {ep + 1}/{epochs} mean_batch_mae={m:.6e}")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(model.encoder.state_dict(), out_path)
+    torch.save(
+        {
+            "state_dict": model.encoder.state_dict(),
+            "input_mean": torch.stack([feat_mean, aoa_mean]).detach().cpu(),
+            "input_std": torch.stack([feat_std, aoa_std]).detach().cpu(),
+            "input_order": [mode, "alpha"],
+        },
+        out_path,
+    )
     print(f"  saved encoder -> {out_path}")
     return curve
 
