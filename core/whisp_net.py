@@ -1,0 +1,159 @@
+"""WHISP: weighted hydrodynamic iterative structured propagation (inverse airfoil design stack)."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+
+from .pair_encoder_loaders import pretrained_pair_embedders
+from .whisp_physics import DeltaTransformer, PreDeltaPhysics
+
+
+class InnerBlock(nn.Module):
+    """One bilinear + projection + routing residual block (shared 5× per outer stage)."""
+
+    def __init__(self, d: int = 8, n_emb: int = 4) -> None:
+        super().__init__()
+        self.d = d
+        self.n_emb = n_emb
+        self.B = nn.Parameter(torch.zeros(n_emb, d, d))
+        self.W_proj = nn.Linear(d * d, d)
+        self.route = nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, n_emb))
+
+    def forward(self, E: torch.Tensor, u: torch.Tensor, route_tau: float = 1.0) -> torch.Tensor:
+        # E: (B, 4, 8), u: (B, 8); route_tau > 0 softens softmax (less collapse early in training).
+        tau = max(float(route_tau), 1e-3)
+        h_parts = []
+        for i in range(self.n_emb):
+            ei = E[:, i, :]
+            outer = torch.bmm(ei.unsqueeze(2), u.unsqueeze(1))
+            M = outer + self.B[i]
+            hi = self.W_proj(M.reshape(E.shape[0], -1))
+            h_parts.append(hi)
+        H = torch.stack(h_parts, dim=1)
+        updated = []
+        for i in range(self.n_emb):
+            s = torch.softmax(self.route(H[:, i, :]) / tau, dim=-1)
+            mix = (s.unsqueeze(-1) * H).sum(dim=1)
+            updated.append(E[:, i, :] + mix)
+        return torch.stack(updated, dim=1)
+
+
+class OuterStage(nn.Module):
+    """Θ_k: inner weights + pre-delta embedding mixer for this outer index."""
+
+    def __init__(self, d: int = 8, n_emb: int = 4, n_inner: int = 5) -> None:
+        super().__init__()
+        self.inner = InnerBlock(d=d, n_emb=n_emb)
+        self.n_inner = n_inner
+        self.w_aero_logits = nn.Linear(n_emb * d, n_emb)
+
+    def run_inner(self, E: torch.Tensor, u: torch.Tensor, route_tau: float = 1.0) -> torch.Tensor:
+        for _ in range(self.n_inner):
+            E = self.inner(E, u, route_tau)
+        return E
+
+    def mix_aero(self, E: torch.Tensor) -> torch.Tensor:
+        logits = self.w_aero_logits(E.reshape(E.shape[0], -1))
+        w = torch.softmax(logits, dim=-1)
+        return (w.unsqueeze(-1) * E).sum(dim=1)
+
+
+class WHISP(nn.Module):
+    """
+    (Cl, Cd, Re_log, Mach, alpha) -> frozen pair encoders -> E (4×8), iterative core,
+    physics auxiliary losses, damped latent-only delta updates, CST head (18).
+    """
+
+    def __init__(
+        self,
+        encoder_ckpts: Sequence[str | Path],
+        d: int = 8,
+        n_emb: int = 4,
+        n_outer: int = 3,
+        n_inner: int = 5,
+        cst_dim: int = 18,
+        freeze_encoders: bool = True,
+    ) -> None:
+        super().__init__()
+        if len(encoder_ckpts) != 4:
+            raise ValueError("encoder_ckpts must list four paths: Cl, Cd, Re, Mach.")
+        self.d = d
+        self.n_emb = n_emb
+        self.n_outer = n_outer
+        self.embeds = pretrained_pair_embedders(encoder_ckpts, latent_dim=d, freeze=freeze_encoders)
+        self.stages = nn.ModuleList([OuterStage(d=d, n_emb=n_emb, n_inner=n_inner) for _ in range(n_outer)])
+        self.w_out_logits = nn.Linear(n_emb * d, n_emb)
+        self.post_stage_ln = nn.LayerNorm(d)
+        self.final_norm = nn.LayerNorm(d)
+        self.head_cst = nn.Linear(d, cst_dim)
+        self.head_cl = nn.Linear(d, 1)
+        self.pre_physics = PreDeltaPhysics(z_dim=d)
+        self.delta_transformer = DeltaTransformer(z_dim=d)
+        self.register_buffer("delta_damping", torch.tensor(0.3, dtype=torch.float32))
+
+    def _stack_pairs(
+        self,
+        cl: torch.Tensor,
+        cd: torch.Tensor,
+        re_log: torch.Tensor,
+        mach: torch.Tensor,
+        alpha: torch.Tensor,
+    ) -> torch.Tensor:
+        pairs = [
+            torch.stack([cl, alpha], dim=-1),
+            torch.stack([cd, alpha], dim=-1),
+            torch.stack([re_log, alpha], dim=-1),
+            torch.stack([mach, alpha], dim=-1),
+        ]
+        return torch.stack(pairs, dim=1)
+
+    def embed(self, pairs: torch.Tensor) -> torch.Tensor:
+        parts = [self.embeds[i](pairs[:, i, :]) for i in range(self.n_emb)]
+        return torch.stack(parts, dim=1)
+
+    def forward(
+        self,
+        cl: torch.Tensor,
+        cd: torch.Tensor,
+        re_log: torch.Tensor,
+        mach: torch.Tensor,
+        alpha: torch.Tensor,
+        route_tau: float = 1.0,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        pairs = self._stack_pairs(cl, cd, re_log, mach, alpha)
+        E = self.embed(pairs)
+        u = E.mean(dim=1)
+        tau = max(float(route_tau), 1e-3)
+
+        aux: dict[str, torch.Tensor] = {"L_ns_list": []}
+        for k, stage in enumerate(self.stages):
+            E = stage.run_inner(E, u, route_tau=tau)
+            a = stage.mix_aero(E)
+            logits = (E * a.unsqueeze(1)).sum(dim=-1)
+            scores = torch.softmax(logits / tau, dim=-1)
+            raw_delta = (scores.unsqueeze(-1) * E).sum(dim=1)
+
+            L_ns, cl_gamma = self.pre_physics(raw_delta)
+            aux["L_ns_list"].append(L_ns)
+            aux[f"cl_gamma_{k}"] = cl_gamma
+
+            du = self.delta_transformer(raw_delta)
+            damp = float(self.delta_damping.item())
+            u = raw_delta + damp * du
+
+            B, four, d_ = E.shape
+            E = self.post_stage_ln(E.reshape(-1, d_)).reshape(B, four, d_)
+
+        logits_out = self.w_out_logits(E.reshape(E.shape[0], -1))
+        w_out = torch.softmax(logits_out, dim=-1)
+        a_final = (w_out.unsqueeze(-1) * E).sum(dim=1)
+        a_final = self.final_norm(a_final)
+        cst_pred = self.head_cst(a_final)
+        aux["cl_direct"] = self.head_cl(a_final).squeeze(-1)
+        aux["a_final"] = a_final
+        aux["E_final"] = E
+        return cst_pred, aux
