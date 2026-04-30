@@ -253,6 +253,10 @@ def main() -> None:
     model = maybe_compile_model(model_base, device, enabled=args.compile, backend=args.compile_backend)
     opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
     last_k = model_base.n_outer - 1
+    ema_ns = torch.tensor(1.0, device=device)
+    ema_clg = torch.tensor(1.0, device=device)
+    ema_cld = torch.tensor(1.0, device=device)
+    ema_beta = float(args.aux_ema_beta)
 
     def forward_losses(
         idx: torch.Tensor, route_tau: float, aux_scale: float, *, update_ema: bool
@@ -320,10 +324,6 @@ def main() -> None:
 
     best_monitor = float("inf")
     stale_epochs = 0
-    ema_ns = torch.tensor(1.0, device=device)
-    ema_clg = torch.tensor(1.0, device=device)
-    ema_cld = torch.tensor(1.0, device=device)
-    ema_beta = float(args.aux_ema_beta)
 
     hist_train_loss: list[float] = []
     hist_val_loss: list[float] = []
