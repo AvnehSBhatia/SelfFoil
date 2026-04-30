@@ -6,3 +6,4 @@ bigfoil/
 *.dat
 *.pkl
 *.csv
+models/original_tensors.pt
