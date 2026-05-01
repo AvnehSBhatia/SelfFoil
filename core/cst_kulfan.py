@@ -269,32 +269,8 @@ class CSTDecoder18(nn.Module):
         self.first_branch = first_branch
 
     def _decode_single(self, z: torch.Tensor, x_coords: torch.Tensor) -> torch.Tensor:
-        # z: [lower(8), upper(8), leading_edge_weight, TE_thickness]
-        n = self.n_weights_per_side
-        lower = z[:n]
-        upper = z[n : 2 * n]
-        le_weight = z[2 * n]
-        te_thickness = z[2 * n + 1]
-
-        x = x_coords.clamp(0.0, 1.0)
-        i_le = int(torch.argmin(x))
-        branch_a = torch.arange(x.shape[0], device=x.device) <= i_le
-        if self.first_branch == "upper":
-            is_upper = branch_a
-        else:
-            is_upper = ~branch_a
-        C = _class_function(x, self.n1, self.n2)
-        S = _bernstein_basis(x, n - 1)
-
-        y = torch.zeros_like(x)
-        y[is_upper] = (C[is_upper].unsqueeze(1) * S[is_upper]) @ upper
-        y[~is_upper] = (C[~is_upper].unsqueeze(1) * S[~is_upper]) @ lower
-
-        y = y + le_weight * x * torch.clamp(1.0 - x, min=0.0) ** (n + 0.5)
-        y = y + torch.where(is_upper, x * te_thickness / 2.0, -x * te_thickness / 2.0)
-
-        xy = torch.stack([x_coords, y], dim=1)
-        return xy.reshape(-1)
+        """Single airfoil; delegates to batched forward (kept for callers/tests)."""
+        return self.forward(z.unsqueeze(0), x_coords.unsqueeze(0))[0]
 
     def forward(self, z: torch.Tensor, x_coords: torch.Tensor) -> torch.Tensor:
         # z: (B,18), x_coords: (B,N)
@@ -303,10 +279,33 @@ class CSTDecoder18(nn.Module):
         if z.shape[0] != x_coords.shape[0]:
             raise ValueError("Batch size mismatch between z and x_coords.")
 
-        outs = []
-        for b in range(z.shape[0]):
-            outs.append(self._decode_single(z[b], x_coords[b]))
-        return torch.stack(outs, dim=0)
+        B, N = x_coords.shape
+        n = self.n_weights_per_side
+        lower = z[:, :n]
+        upper = z[:, n : 2 * n]
+        le_weight = z[:, 2 * n]
+        te_thickness = z[:, 2 * n + 1]
+
+        x = x_coords.clamp(0.0, 1.0)
+        i_le = torch.argmin(x, dim=-1)
+        idx = torch.arange(N, device=x.device, dtype=torch.long)
+        branch_a = idx.view(1, N) <= i_le.view(B, 1)
+        is_upper = branch_a if self.first_branch == "upper" else ~branch_a
+
+        xf = x.reshape(-1)
+        C = _class_function(xf, self.n1, self.n2).reshape(B, N)
+        S = _bernstein_basis(xf, n - 1).reshape(B, N, n)
+        CS = C.unsqueeze(-1) * S
+
+        is_u = is_upper.to(dtype=x.dtype).unsqueeze(-1)
+        is_l = (~is_upper).to(dtype=x.dtype).unsqueeze(-1)
+        y = torch.bmm(CS * is_u, upper.unsqueeze(-1)).squeeze(-1) + torch.bmm(CS * is_l, lower.unsqueeze(-1)).squeeze(-1)
+
+        y = y + le_weight.unsqueeze(-1) * x * torch.clamp(1.0 - x, min=0.0) ** (n + 0.5)
+        y = y + torch.where(is_upper, x * te_thickness.unsqueeze(-1) / 2.0, -x * te_thickness.unsqueeze(-1) / 2.0)
+
+        xy = torch.stack([x_coords, y], dim=-1)
+        return xy.reshape(B, -1)
 
 
 def build_analytic_cst_decoder(models_dir: Path, device: torch.device) -> CSTDecoder18:
