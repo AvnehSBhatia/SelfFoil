@@ -1,0 +1,6 @@
+{
+"run_id": "baseline/no_physics",
+"epoch": 80,
+"final_val_geo_mae": 0.005792594980448484,
+"convergence_epoch_val_geo_mae_below_0.02": 1
+}

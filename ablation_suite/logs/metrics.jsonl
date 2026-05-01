@@ -1,0 +1,5 @@
+{"model": "baseline/full", "category": "baseline", "slug": "full", "cst_error": 1.100093, "cl_error": 0.846104, "cd_error": 0.003346, "epoch": 80, "trainable_params": 647, "frac_train": 0.8}
+{"model": "baseline/no_delta", "category": "baseline", "slug": "no_delta", "cst_error": 1.052082, "cl_error": 0.001303, "cd_error": 0.003346, "epoch": 80, "trainable_params": 647, "frac_train": 0.8}
+{"model": "baseline/no_physics", "category": "baseline", "slug": "no_physics", "cst_error": 1.200263, "cl_error": null, "cd_error": 0.003346, "epoch": 80, "trainable_params": 3663, "frac_train": 0.8}
+{"model": "baseline/no_routing", "category": "baseline", "slug": "no_routing", "cst_error": 1.088945, "cl_error": 0.847259, "cd_error": 0.003346, "epoch": 80, "trainable_params": 647, "frac_train": 0.8}
+{"model": "delta/identity_delta", "category": "delta", "slug": "identity_delta", "cst_error": 1.104204, "cl_error": 0.001447, "cd_error": 0.003346, "epoch": 80, "trainable_params": 647, "frac_train": 0.8}
