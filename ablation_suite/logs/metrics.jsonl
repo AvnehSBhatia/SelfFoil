@@ -3,3 +3,17 @@
 {"model": "baseline/no_physics", "category": "baseline", "slug": "no_physics", "cst_error": 1.200263, "cl_error": null, "cd_error": 0.003346, "epoch": 80, "trainable_params": 3663, "frac_train": 0.8}
 {"model": "baseline/no_routing", "category": "baseline", "slug": "no_routing", "cst_error": 1.088945, "cl_error": 0.847259, "cd_error": 0.003346, "epoch": 80, "trainable_params": 647, "frac_train": 0.8}
 {"model": "delta/identity_delta", "category": "delta", "slug": "identity_delta", "cst_error": 1.104204, "cl_error": 0.001447, "cd_error": 0.003346, "epoch": 80, "trainable_params": 647, "frac_train": 0.8}
+{"model": "delta/reference", "category": "delta", "slug": "reference", "cst_error": 1.100093, "cl_error": 0.846104, "cd_error": 0.003346, "epoch": 80, "trainable_params": 647, "frac_train": 0.8}
+{"model": "encoder/finetune", "category": "encoder", "slug": "finetune", "cst_error": 1.081612, "cl_error": 0.847258, "cd_error": 0.003346, "epoch": 80, "trainable_params": 743, "frac_train": 0.8}
+{"model": "encoder/frozen", "category": "encoder", "slug": "frozen", "cst_error": 1.100093, "cl_error": 0.846104, "cd_error": 0.003346, "epoch": 80, "trainable_params": 647, "frac_train": 0.8}
+{"model": "interaction/linear_only", "category": "interaction", "slug": "linear_only", "cst_error": 1.002365, "cl_error": 0.000776, "cd_error": 0.003346, "epoch": 80, "trainable_params": 647, "frac_train": 0.8}
+{"model": "interaction/reference", "category": "interaction", "slug": "reference", "cst_error": 1.100093, "cl_error": 0.846104, "cd_error": 0.003346, "epoch": 80, "trainable_params": 647, "frac_train": 0.8}
+{"model": "iteration/reference", "category": "iteration", "slug": "reference", "cst_error": 1.100093, "cl_error": 0.846104, "cd_error": 0.003346, "epoch": 80, "trainable_params": 647, "frac_train": 0.8}
+{"model": "iteration/single_pass", "category": "iteration", "slug": "single_pass", "cst_error": 1.073938, "cl_error": 0.847259, "cd_error": 0.003346, "epoch": 80, "trainable_params": 1989, "frac_train": 0.8}
+{"model": "loss/geo_only", "category": "loss", "slug": "geo_only", "cst_error": 1.030673, "cl_error": 57.617475, "cd_error": 0.003346, "epoch": 80, "trainable_params": 647, "frac_train": 0.8}
+{"model": "loss/reference", "category": "loss", "slug": "reference", "cst_error": 1.100093, "cl_error": 0.846104, "cd_error": 0.003346, "epoch": 80, "trainable_params": 647, "frac_train": 0.8}
+{"model": "numerics/reference", "category": "numerics", "slug": "reference", "cst_error": 1.100093, "cl_error": 0.846104, "cd_error": 0.003346, "epoch": 80, "trainable_params": 647, "frac_train": 0.8}
+{"model": "numerics/simpson", "category": "numerics", "slug": "simpson", "cst_error": 1.079475, "cl_error": 0.84728, "cd_error": 0.003346, "epoch": 80, "trainable_params": 647, "frac_train": 0.8}
+{"model": "physics/no_bl", "category": "physics", "slug": "no_bl", "cst_error": 1.07184, "cl_error": 0.000128, "cd_error": 0.003346, "epoch": 80, "trainable_params": 647, "frac_train": 0.8}
+{"model": "physics/no_circulation", "category": "physics", "slug": "no_circulation", "cst_error": 1.012108, "cl_error": 0.847258, "cd_error": 0.003346, "epoch": 80, "trainable_params": 647, "frac_train": 0.8}
+{"model": "physics/reference", "category": "physics", "slug": "reference", "cst_error": 1.100093, "cl_error": 0.846104, "cd_error": 0.003346, "epoch": 80, "trainable_params": 647, "frac_train": 0.8}
