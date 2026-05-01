@@ -104,6 +104,50 @@ def _kulfan_matrix_rows_batched(
     return torch.cat([lower_block, upper_block, le_col, te_col], dim=-1)
 
 
+def _infer_upper_mask_from_branches(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Infer upper/lower branch membership from contour branch means.
+
+    The contour is expected in TE -> LE -> TE order, but either branch can come first.
+    """
+    n = int(x.shape[0])
+    i_le = int(torch.argmin(x).item())
+    j = torch.arange(n, device=x.device, dtype=torch.long)
+    branch_a = j <= i_le
+    branch_b = ~branch_a
+    # Robust fallback if LE is at an endpoint (degenerate ordering).
+    if not branch_b.any():
+        branch_b = j >= i_le
+    mean_a = y[branch_a].mean()
+    mean_b = y[branch_b].mean()
+    if mean_a >= mean_b:
+        return branch_a
+    return branch_b
+
+
+def _infer_upper_mask_from_branches_batched(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Vectorized branch inference for TE->LE->TE contours."""
+    B, N = x.shape
+    i_le = x.argmin(dim=1)
+    j = torch.arange(N, device=x.device, dtype=torch.long).view(1, N).expand(B, N)
+    branch_a = j <= i_le.unsqueeze(1)
+    branch_b = ~branch_a
+
+    # Degenerate safeguard: if LE is at one end, ensure both masks have support.
+    cnt_b = branch_b.sum(dim=1)
+    deg = cnt_b == 0
+    if deg.any():
+        alt_b = j >= i_le.unsqueeze(1)
+        branch_b = torch.where(deg.unsqueeze(1), alt_b, branch_b)
+        branch_a = ~branch_b
+
+    cnt_a = branch_a.sum(dim=1).clamp_min(1)
+    cnt_b = branch_b.sum(dim=1).clamp_min(1)
+    mean_a = (y * branch_a.to(y.dtype)).sum(dim=1) / cnt_a.to(y.dtype)
+    mean_b = (y * branch_b.to(y.dtype)).sum(dim=1) / cnt_b.to(y.dtype)
+    a_is_upper = mean_a >= mean_b
+    return torch.where(a_is_upper.unsqueeze(1), branch_a, branch_b)
+
+
 def fit_cst18_from_xy_batched(
     xy: torch.Tensor,
     n_weights_per_side: int = 8,
@@ -122,9 +166,7 @@ def fit_cst18_from_xy_batched(
     B, N, _ = xy.shape
     x = xy[..., 0].clamp(0.0, 1.0)
     y = xy[..., 1]
-    i_le = x.argmin(dim=1)
-    j = torch.arange(N, device=x.device, dtype=torch.long).view(1, N).expand(B, N)
-    is_upper = j <= i_le.unsqueeze(1)
+    is_upper = _infer_upper_mask_from_branches_batched(x, y)
 
     A = _kulfan_matrix_rows_batched(x, is_upper, n_weights_per_side, n1, n2)
     d = A.shape[-1]
@@ -208,11 +250,20 @@ class CSTEncoder18(nn.Module):
 class CSTDecoder18(nn.Module):
     """Analytic CST decoder: (18 coeffs + x-grid) -> flattened (x,y) coordinates."""
 
-    def __init__(self, n_weights_per_side: int = 8, n1: float = 0.5, n2: float = 1.0) -> None:
+    def __init__(
+        self,
+        n_weights_per_side: int = 8,
+        n1: float = 0.5,
+        n2: float = 1.0,
+        first_branch: str = "upper",
+    ) -> None:
         super().__init__()
         self.n_weights_per_side = n_weights_per_side
         self.n1 = n1
         self.n2 = n2
+        if first_branch not in ("lower", "upper"):
+            raise ValueError("first_branch must be 'lower' or 'upper'.")
+        self.first_branch = first_branch
 
     def _decode_single(self, z: torch.Tensor, x_coords: torch.Tensor) -> torch.Tensor:
         # z: [lower(8), upper(8), leading_edge_weight, TE_thickness]
@@ -224,7 +275,11 @@ class CSTDecoder18(nn.Module):
 
         x = x_coords.clamp(0.0, 1.0)
         i_le = int(torch.argmin(x))
-        is_upper = torch.arange(x.shape[0], device=x.device) <= i_le
+        branch_a = torch.arange(x.shape[0], device=x.device) <= i_le
+        if self.first_branch == "upper":
+            is_upper = branch_a
+        else:
+            is_upper = ~branch_a
         C = _class_function(x, self.n1, self.n2)
         S = _bernstein_basis(x, n - 1)
 

@@ -144,7 +144,7 @@ class WHISP(nn.Module):
             scores = torch.softmax(logits * inv_tau, dim=-1)
             raw_delta = (scores.unsqueeze(-1) * E).sum(dim=1)
 
-            L_ns, cl_gamma = self.pre_physics(raw_delta)
+            L_ns, cl_gamma = self.pre_physics(raw_delta, return_predelta_feats=False)
             l_ns_acc = L_ns if l_ns_acc is None else l_ns_acc + L_ns
             aux[f"cl_gamma_{k}"] = cl_gamma
 

@@ -34,6 +34,9 @@ DEFAULT_MODEL_FLAGS: dict[str, object] = {
     "physics_nx": 32,
     "adaptive_x_grid": False,
     "distill_weight": 0.0,
+    # If True, pool summaries of PreDeltaPhysics channels (U_e, H, C_f) and apply a learned
+    # bias+gate to `raw_delta` before the delta MLP (ablation; requires use_physics=True).
+    "physics_delta_embed": False,
     "d": 8,
     "n_emb": 4,
     "dropout_p": 0.05,
@@ -261,6 +264,8 @@ class WHISPAblated(nn.Module):
         self.head_cl = nn.Linear(d, 1)
         self.register_buffer("delta_damping", torch.tensor(0.3, dtype=torch.float32))
         self.delta_damping_value = 0.3
+        self.physics_delta_embed = bool(m.get("physics_delta_embed", False))
+        self._predelta_feats_for_delta: torch.Tensor | None = None
         nx = int(m["physics_nx"])
         if self.use_physics:
             self.pre_physics = PreDeltaPhysics(
@@ -272,6 +277,19 @@ class WHISPAblated(nn.Module):
             )
         else:
             self.pre_physics = None
+        if self.physics_delta_embed:
+            if not self.use_physics or self.pre_physics is None:
+                raise ValueError("physics_delta_embed=True requires use_physics=True.")
+            if d != 8:
+                raise ValueError("physics_delta_embed currently assumes d==8 (PreDeltaPhysics z_dim).")
+            # Pooled stats: 4 each for U_e, H, log(Cf) -> 12 dims.
+            self.phys_delta_bias = nn.Linear(12, d)
+            self.phys_delta_gate = nn.Linear(12, d)
+            nn.init.zeros_(self.phys_delta_bias.bias)
+            nn.init.zeros_(self.phys_delta_gate.bias)
+        else:
+            self.phys_delta_bias = None
+            self.phys_delta_gate = None
         if self.delta_mode == "linear":
             self.delta_transformer = LinearDelta(d)
             self.lat_expand = None
@@ -284,6 +302,12 @@ class WHISPAblated(nn.Module):
         if self.freeze_delta_bool():
             for p in self.delta_transformer.parameters():
                 p.requires_grad_(False)
+            if self.phys_delta_bias is not None:
+                for p in self.phys_delta_bias.parameters():
+                    p.requires_grad_(False)
+            if self.phys_delta_gate is not None:
+                for p in self.phys_delta_gate.parameters():
+                    p.requires_grad_(False)
         if self.distill_weight > 0.0 and enc_mode != "scratch":
             self.teacher_embeds = pretrained_pair_embedders(encoder_ckpts, latent_dim=d, freeze=True)
         else:
@@ -329,19 +353,29 @@ class WHISPAblated(nn.Module):
         return z
 
     def _delta_du(self, raw_delta: torch.Tensor) -> torch.Tensor:
+        if self.physics_delta_embed and self.phys_delta_bias is not None and self.phys_delta_gate is not None:
+            feats = self._predelta_feats_for_delta
+            if feats is None:
+                z_in = raw_delta
+            else:
+                bias = self.phys_delta_bias(feats)
+                gate = torch.sigmoid(self.phys_delta_gate(feats))
+                z_in = raw_delta * gate + bias
+        else:
+            z_in = raw_delta
         if self.delta_mode == "expanded":
             assert self.lat_expand is not None and isinstance(self.delta_transformer, nn.Linear)
-            z_in = torch.cat([raw_delta, self.lat_expand(raw_delta)], dim=-1)
-            return self.delta_transformer(z_in)
+            z_cat = torch.cat([z_in, self.lat_expand(raw_delta)], dim=-1)
+            return self.delta_transformer(z_cat)
         if self.delta_mode == "linear":
-            return self.delta_transformer(raw_delta)
-        z_in = self._z_for_delta(raw_delta)
+            return self.delta_transformer(z_in)
+        z_mlp = self._z_for_delta(z_in)
         if self.delta_mode == "random":
             return torch.randn_like(raw_delta) * self.random_delta_std
         if self.delta_mode == "sign":
-            du = self.delta_transformer(raw_delta)
+            du = self.delta_transformer(z_mlp)
             return torch.sign(du.detach()) * 0.1 + du - du.detach()
-        return self.delta_transformer(z_in)
+        return self.delta_transformer(z_mlp)
 
     def forward(
         self,
@@ -369,6 +403,7 @@ class WHISPAblated(nn.Module):
             outer_indices = outer_indices[::-1]
         l_ns_acc: torch.Tensor | None = None
         n_phys = 0
+        self._predelta_feats_for_delta = None
         for step_i, k in enumerate(outer_indices):
             stage = self.stages[0] if self._shared_outer else self.stages[k]
             u_loop = u_mean_fixed if not self.use_delta else u
@@ -378,7 +413,12 @@ class WHISPAblated(nn.Module):
             scores = torch.softmax(logits * inv_tau, dim=-1)
             raw_delta = (scores.unsqueeze(-1) * E).sum(dim=1)
             if self.use_physics and self.pre_physics is not None:
-                L_ns, cl_gamma = self.pre_physics(raw_delta)
+                if self.physics_delta_embed:
+                    L_ns, cl_gamma, predelta_feats = self.pre_physics(raw_delta, return_predelta_feats=True)
+                    self._predelta_feats_for_delta = predelta_feats
+                else:
+                    L_ns, cl_gamma = self.pre_physics(raw_delta)
+                    self._predelta_feats_for_delta = None
                 l_ns_acc = L_ns if l_ns_acc is None else l_ns_acc + L_ns
                 n_phys += 1
                 aux[f"cl_gamma_{k}"] = cl_gamma
@@ -392,6 +432,7 @@ class WHISPAblated(nn.Module):
                 u = raw_delta + damp * decay * du
             B = E.shape[0]
             E = self.post_stage_ln(E.contiguous().view(-1, self.d)).view(B, self.n_emb, self.d)
+            self._predelta_feats_for_delta = None
         if l_ns_acc is not None and n_phys > 0:
             aux["L_ns"] = l_ns_acc.mean() / n_phys
         else:

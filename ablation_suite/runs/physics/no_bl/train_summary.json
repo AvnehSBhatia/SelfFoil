@@ -1,6 +1,0 @@
-{
-"run_id": "physics/no_bl",
-"epoch": 80,
-"final_val_geo_mae": 0.005687755066901445,
-"convergence_epoch_val_geo_mae_below_0.02": 1
-}

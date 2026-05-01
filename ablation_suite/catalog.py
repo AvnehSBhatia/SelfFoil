@@ -52,6 +52,12 @@ BASELINE_SPECS: dict[str, dict[str, Any]] = {
 # --- 6. Physics fidelity ---
 PHYSICS_SPECS: dict[str, dict[str, Any]] = {
     run_id("physics", "reference"): _spec("physics", "reference", physics_fidelity="full"),
+    run_id("physics", "predelta_bias"): _spec(
+        "physics",
+        "predelta_bias",
+        physics_fidelity="full",
+        physics_delta_embed=True,
+    ),
     run_id("physics", "no_bl"): _spec("physics", "no_bl", physics_fidelity="no_bl"),
     run_id("physics", "no_circulation"): _spec("physics", "no_circulation", physics_fidelity="no_circulation"),
     run_id("physics", "no_energy_term"): _spec("physics", "no_energy_term", physics_fidelity="no_energy_term"),

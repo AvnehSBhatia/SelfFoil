@@ -44,7 +44,9 @@ def _fourier_phi(x: torch.Tensor, n_modes: int = 8) -> torch.Tensor:
 class PreDeltaPhysics(nn.Module):
     """
     z -> U_e, H, C_f -> momentum thickness march -> dimensionless NS residual loss + circulation Cl.
-    Physics is used only as regularization (L_ns, cl_gamma); no separate p-vector feeds the delta MLP.
+
+    By default this module only contributes auxiliary losses (L_ns, cl_gamma). Optionally it can also
+    expose cheap pooled summaries of (U_e, H, C_f) for downstream delta conditioning.
     """
 
     def __init__(
@@ -96,7 +98,20 @@ class PreDeltaPhysics(nn.Module):
             return _simpson_yx(y, x)
         return _trapz_yx(y, x)
 
-    def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _predelta_channel_stats(self, U_e: torch.Tensor, H: torch.Tensor, C_f: torch.Tensor) -> torch.Tensor:
+        """Cheap pooled summaries of the pre-delta physics channels (B, 12)."""
+        def _stats(t: torch.Tensor) -> list[torch.Tensor]:
+            return [t.mean(dim=-1), t.std(dim=-1), t.min(dim=-1).values, t.max(dim=-1).values]
+
+        parts: list[torch.Tensor] = []
+        parts.extend(_stats(U_e))
+        parts.extend(_stats(H))
+        parts.extend(_stats(torch.log(C_f.clamp(min=1e-6))))
+        return torch.stack(parts, dim=-1)
+
+    def forward(
+        self, z: torch.Tensor, *, return_predelta_feats: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         z: (B, 8)
         Returns:
@@ -125,6 +140,7 @@ class PreDeltaPhysics(nn.Module):
         loc = torch.cat([zx, xx], dim=-1)
         H = 2.0 + 0.5 * torch.tanh(self.mlp_H(loc).squeeze(-1))
         C_f = 1e-3 + torch.nn.functional.softplus(self.mlp_Cf(loc).squeeze(-1))
+        predelta_feats = self._predelta_channel_stats(U_e, H, C_f) if return_predelta_feats else None
 
         dUedx = torch.zeros(B, nx, device=device, dtype=dtype)
         if nx > 2:
@@ -142,6 +158,9 @@ class PreDeltaPhysics(nn.Module):
             V = self.U_inf.abs().clamp(min=1e-3)
             cl_gamma = (2.0 * Gamma / (V * chord)) * self.cl_amp + self.cl_bias
             L_ns = torch.zeros(B, device=device, dtype=dtype)
+            if return_predelta_feats:
+                assert predelta_feats is not None
+                return L_ns, cl_gamma, predelta_feats
             return L_ns, cl_gamma
 
         theta_seq = [t0]
@@ -183,6 +202,9 @@ class PreDeltaPhysics(nn.Module):
         if self.fidelity_mode == "no_circulation":
             cl_gamma = torch.zeros_like(cl_gamma) + self.cl_bias
 
+        if return_predelta_feats:
+            assert predelta_feats is not None
+            return L_ns, cl_gamma, predelta_feats
         return L_ns, cl_gamma
 
 

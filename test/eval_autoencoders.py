@@ -119,13 +119,15 @@ def main() -> None:
     dec_path = models_dir / "decoder_coords.pt"
     if dec_path.is_file():
         meta = torch.load(dec_path, map_location=device, weights_only=True)
+        first_branch = "upper"
         if isinstance(meta, dict) and meta.get("type") == "analytic_cst_decoder":
+            first_branch = str(meta.get("first_branch", "lower"))
             print(
                 "CST:",
-                f"n_weights_per_side={meta.get('n_weights_per_side')}, n1={meta.get('n1')}, n2={meta.get('n2')}",
+                f"n_weights_per_side={meta.get('n_weights_per_side')}, n1={meta.get('n1')}, n2={meta.get('n2')}, first_branch={first_branch}",
             )
         enc = CSTEncoder18(coord_dim, n_weights_per_side=8, n1=0.5, n2=1.0).to(device)
-        dec = CSTDecoder18(n_weights_per_side=8, n1=0.5, n2=1.0).to(device)
+        dec = CSTDecoder18(n_weights_per_side=8, n1=0.5, n2=1.0, first_branch=first_branch).to(device)
         xgrid = bundle["x_coords"].unsqueeze(0)
         n_plot = min(3, int(bundle["n_rows"]))
         plt.figure(figsize=(10, 3))

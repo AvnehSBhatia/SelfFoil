@@ -1,6 +1,0 @@
-{
-"run_id": "loss/geo_only",
-"epoch": 80,
-"final_val_geo_mae": 0.004369198810309172,
-"convergence_epoch_val_geo_mae_below_0.02": 1
-}

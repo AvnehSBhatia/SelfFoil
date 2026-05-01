@@ -136,6 +136,7 @@ def save_cst_meta(out_path: Path, decoder: CSTDecoder18) -> None:
             "n_weights_per_side": decoder.n_weights_per_side,
             "n1": decoder.n1,
             "n2": decoder.n2,
+            "first_branch": decoder.first_branch,
         },
         out_path,
     )
@@ -153,6 +154,12 @@ def main() -> None:
     p.add_argument("--batch-rows", type=int, default=512, help="Airfoil rows per CST MAE batch")
     p.add_argument("--device", default="cuda", choices=["auto", "cpu", "mps", "cuda"])
     p.add_argument("--run-cst-eval", action="store_true", help="Run optional CST MAE evaluation loop")
+    p.add_argument(
+        "--cst-eval-passes",
+        type=int,
+        default=1,
+        help="How many batched CST eval passes to run when --run-cst-eval is set",
+    )
     args = p.parse_args()
 
     device = resolve_device(args.device)
@@ -198,17 +205,18 @@ def main() -> None:
     fig_p.savefig(fd / "train_autoencoders_pair_mae_curves.png", dpi=220)
     plt.close(fig_p)
 
-    decoder = CSTDecoder18(n_weights_per_side=8, n1=0.5, n2=1.0)
+    decoder = CSTDecoder18(n_weights_per_side=8, n1=0.5, n2=1.0, first_branch="upper")
     if args.run_cst_eval:
         print(f"CST reconstruction MAE (coord_dim={coord_dim}) on {device}...")
         cst_mae_curve: list[float] = []
-        for ep in range(args.epochs):
+        n_passes = max(1, int(args.cst_eval_passes))
+        for ep in range(n_passes):
             mae = eval_cst_mae_batched(bundle, device, args.batch_rows, coord_dim)
             cst_mae_curve.append(mae)
-            print(f"  [CST] pass {ep + 1}/{args.epochs} mean_batch_mae={mae:.6e}")
+            print(f"  [CST] pass {ep + 1}/{n_passes} mean_batch_mae={mae:.6e}")
 
         fig_c, ax_c = plt.subplots(figsize=(8, 4))
-        ax_c.plot(range(1, args.epochs + 1), cst_mae_curve, marker=".", color="C2")
+        ax_c.plot(range(1, n_passes + 1), cst_mae_curve, marker=".", color="C2")
         ax_c.set_xlabel("pass")
         ax_c.set_ylabel("mean batch MAE (coords)")
         ax_c.set_title("CST encoder/decoder coordinate reconstruction (batched MAE)")

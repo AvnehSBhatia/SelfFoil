@@ -176,6 +176,9 @@ def set_requires_grad_(module: nn.Module, enabled: bool) -> None:
 
 def set_two_stage_trainable(model: WHISP, stage: str) -> None:
     """Configure trainable params for two-stage training."""
+    phys_bias = getattr(model, "phys_delta_bias", None)
+    phys_gate = getattr(model, "phys_delta_gate", None)
+
     if stage == "geo":
         # Geometry stage: train full geometry path (and direct cl head), keep physics soft.
         set_requires_grad_(model.stages, True)
@@ -186,6 +189,10 @@ def set_two_stage_trainable(model: WHISP, stage: str) -> None:
         set_requires_grad_(model.head_cl, True)
         set_requires_grad_(model.pre_physics, True)
         set_requires_grad_(model.delta_transformer, True)
+        if phys_bias is not None:
+            set_requires_grad_(phys_bias, True)
+        if phys_gate is not None:
+            set_requires_grad_(phys_gate, True)
         return
     if stage == "aux":
         # Aux stage: freeze geometry-producing path, train physics/delta/direct lift only.
@@ -197,6 +204,10 @@ def set_two_stage_trainable(model: WHISP, stage: str) -> None:
         set_requires_grad_(model.head_cl, True)
         set_requires_grad_(model.pre_physics, True)
         set_requires_grad_(model.delta_transformer, True)
+        if phys_bias is not None:
+            set_requires_grad_(phys_bias, True)
+        if phys_gate is not None:
+            set_requires_grad_(phys_gate, True)
         return
     raise ValueError(f"Unknown two-stage mode: {stage}")
 
