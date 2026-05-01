@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Train WHISP: (Cl, Cd, Re, Mach, alpha) -> CST18 using frozen pair encoders + stabilized physics losses.
+"""Train inverse models (Cl, Cd, Re, Mach, alpha) -> CST18.
+
+WHISP uses frozen pair encoders plus auxiliary physics losses. ``--arch cst-mlp`` trains a
+small MLP (5→32→64→18) on geometry loss only (no encoders or aux terms).
 
 Geometry loss is MAE (or Huber) on flattened airfoil coordinates after analytic CST decode, not MAE on CST coefficients.
 """
@@ -27,7 +30,7 @@ from core.csv_tensor_cache import load_or_build_cache
 from core.cst_kulfan import build_analytic_cst_decoder, coord_geo_loss_from_cst
 from core.device import configure_cuda_training, resolve_device
 from core.figures_path import figures_dir
-from core.whisp_net import WHISP
+from core.whisp_net import CstMLP, WHISP
 
 
 def move_bundle(bundle: dict, device: torch.device) -> dict:
@@ -179,8 +182,10 @@ def set_requires_grad_(module: nn.Module, enabled: bool) -> None:
         p.requires_grad_(enabled)
 
 
-def set_two_stage_trainable(model: WHISP, stage: str) -> None:
+def set_two_stage_trainable(model: nn.Module, stage: str) -> None:
     """Configure trainable params for two-stage training."""
+    if not isinstance(model, WHISP):
+        raise TypeError("two-stage training is only supported for WHISP")
     phys_bias = getattr(model, "phys_delta_bias", None)
     phys_gate = getattr(model, "phys_delta_gate", None)
 
@@ -219,6 +224,12 @@ def set_two_stage_trainable(model: WHISP, stage: str) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser()
+    p.add_argument(
+        "--arch",
+        default="whisp",
+        choices=["whisp", "cst-mlp"],
+        help="whisp: encoder stack + iterative core; cst-mlp: 5→32→64→18 MLP, geometry loss only",
+    )
     p.add_argument("--csv", type=Path, default=ROOT / "data" / "original.csv")
     p.add_argument("--cache", type=Path, default=ROOT / "models" / "original_tensors.pt")
     p.add_argument("--rebuild-cache", action="store_true")
@@ -235,7 +246,12 @@ def main() -> None:
     p.add_argument("--frac-val", type=float, default=0.1)
     p.add_argument("--max-rows", type=int, default=None)
     p.add_argument("--device", default="cuda", choices=["auto", "cpu", "mps", "cuda"])
-    p.add_argument("--out", type=Path, default=ROOT / "models" / "whisp.pt")
+    p.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Checkpoint path (default: models/whisp.pt or models/cst_mlp.pt from --arch)",
+    )
     p.add_argument("--models-dir", type=Path, default=ROOT / "models", help="Directory with encoder_*.pt from train_autoencoders")
     p.add_argument("--enc-cl", type=Path, default=None)
     p.add_argument("--enc-cd", type=Path, default=None)
@@ -291,6 +307,11 @@ def main() -> None:
     p.add_argument("--stage1-aux-scale", type=float, default=0.1, help="Aux scale used in geometry stage")
     p.add_argument("--stage2-aux-scale", type=float, default=1.0, help="Aux scale used in auxiliary stage")
     args = p.parse_args()
+    is_mlp = args.arch == "cst-mlp"
+    if args.out is None:
+        args.out = ROOT / "models" / ("cst_mlp.pt" if is_mlp else "whisp.pt")
+    if is_mlp and args.two_stage:
+        raise SystemExit("--two-stage is only supported with --arch whisp")
 
     device = resolve_device(args.device)
     configure_cuda_training(device, deterministic=False)
@@ -300,13 +321,14 @@ def main() -> None:
     enc_re = args.enc_re or md / "encoder_re_alpha.pt"
     enc_mach = args.enc_mach or md / "encoder_mach_alpha.pt"
     encoder_ckpts = (enc_cl, enc_cd, enc_re, enc_mach)
-    for path in encoder_ckpts:
-        if not path.is_file():
-            raise SystemExit(
-                f"Missing pair encoder checkpoint: {path}\n"
-                "Train them first: python scripts/train_autoencoders.py\n"
-                "Or pass --enc-cl, --enc-cd, --enc-re, --enc-mach."
-            )
+    if not is_mlp:
+        for path in encoder_ckpts:
+            if not path.is_file():
+                raise SystemExit(
+                    f"Missing pair encoder checkpoint: {path}\n"
+                    "Train them first: python scripts/train_autoencoders.py\n"
+                    "Or pass --enc-cl, --enc-cd, --enc-re, --enc-mach."
+                )
 
     bundle_cpu = load_or_build_cache(args.csv, args.cache, args.max_rows, args.rebuild_cache)
     missing = required_bundle_keys() - set(bundle_cpu.keys())
@@ -327,10 +349,13 @@ def main() -> None:
     if train_idx.numel() == 0 or val_idx.numel() == 0:
         raise SystemExit("Empty train or val polar split; adjust fractions or dataset size.")
 
-    model_base = WHISP(encoder_ckpts=encoder_ckpts, dropout_p=args.dropout_start).to(device)
+    if is_mlp:
+        model_base = CstMLP(dropout_p=args.dropout_start).to(device)
+    else:
+        model_base = WHISP(encoder_ckpts=encoder_ckpts, dropout_p=args.dropout_start).to(device)
     model = maybe_compile_model(model_base, device, enabled=args.compile, backend=args.compile_backend)
     cst_decoder = build_analytic_cst_decoder(md, device)
-    last_k = model_base.n_outer - 1
+    last_k = model_base.n_outer - 1 if isinstance(model_base, WHISP) else 0
     ema_ns = torch.tensor(1.0, device=device)
     ema_clg = torch.tensor(1.0, device=device)
     ema_cld = torch.tensor(1.0, device=device)
@@ -356,6 +381,10 @@ def main() -> None:
             loss=args.geo_loss,
             huber_delta=args.huber_delta,
         )
+        if is_mlp:
+            z = torch.zeros((), device=device, dtype=l_geo.dtype)
+            parts = {"geo": l_geo, "ns": z, "clg": z, "cld": z}
+            return l_geo, parts
         l_ns = aux["L_ns"]
         l_cl_g = nn.functional.mse_loss(aux[f"cl_gamma_{last_k}"], cl)
         l_cl_d = nn.functional.mse_loss(aux["cl_direct"], cl)
@@ -375,9 +404,11 @@ def main() -> None:
         parts = {"geo": l_geo, "ns": l_ns, "clg": l_cl_g, "cld": l_cl_d}
         return loss, parts
 
-    print(f"Device={device} | train polar={train_idx.numel()} val polar={val_idx.numel()} | rows={n_rows}")
+    arch_label = "CstMLP" if is_mlp else "WHISP"
+    print(f"Device={device} | arch={args.arch} | train polar={train_idx.numel()} val polar={val_idx.numel()} | rows={n_rows}")
     n_trainable = sum(x.numel() for x in model_base.parameters() if x.requires_grad)
-    print(f"WHISP trainable parameters: {n_trainable} (pair encoders frozen)")
+    enc_note = "" if is_mlp else " (pair encoders frozen)"
+    print(f"{arch_label} trainable parameters: {n_trainable}{enc_note}")
     total_train_batches = train_batch_count(train_idx.numel(), args.batch, args.max_train_batches)
     total_val_batches = train_batch_count(val_idx.numel(), args.batch, args.max_val_batches)
     print(
@@ -406,7 +437,7 @@ def main() -> None:
     stage_stale = 0
     stage_monitor_hist: list[float] = []
     if args.two_stage:
-        set_two_stage_trainable(model_base, stage)
+        set_two_stage_trainable(model_base, stage)  # isinstance WHISP checked inside
         print(
             f"Two-stage enabled: cycles={args.stage_cycles}, stage-switch monitor={args.early_stop_monitor}, "
             f"patience={args.early_stop_patience}, min_delta={args.early_stop_min_delta:g}"
@@ -589,7 +620,7 @@ def main() -> None:
     ax1.set_xlabel("epoch")
     ax1.set_ylabel("loss")
     ax1.legend()
-    ax1.set_title("WHISP training / validation loss")
+    ax1.set_title(f"{arch_label} training / validation loss")
     fig1.tight_layout()
     fig1.savefig(fd / "train_whisp_loss_curves.png", dpi=220)
     plt.close(fig1)
@@ -599,7 +630,7 @@ def main() -> None:
     ax2.set_xlabel("epoch")
     ax2.set_ylabel("MAE")
     ax2.legend()
-    ax2.set_title("WHISP validation geometry (coordinate MAE)")
+    ax2.set_title(f"{arch_label} validation geometry (coordinate MAE)")
     fig2.tight_layout()
     fig2.savefig(fd / "train_whisp_val_cst_mae.png", dpi=220)
     plt.close(fig2)
@@ -615,7 +646,7 @@ def main() -> None:
     axes[1, 1].set_ylabel("train cl_direct MSE")
     for ax in axes.ravel():
         ax.set_xlabel("epoch")
-    fig3.suptitle("WHISP loss components (train batch means)")
+    fig3.suptitle(f"{arch_label} loss components (train batch means)")
     fig3.tight_layout()
     fig3.savefig(fd / "train_whisp_loss_components.png", dpi=220)
     plt.close(fig3)
@@ -624,7 +655,7 @@ def main() -> None:
     ax4.plot(ep_axis, hist_tau, color="C4", marker=".", ms=3)
     ax4.set_xlabel("epoch")
     ax4.set_ylabel("τ (routing softmax temp)")
-    ax4.set_title("WHISP routing temperature schedule")
+    ax4.set_title(f"{arch_label} routing temperature schedule")
     fig4.tight_layout()
     fig4.savefig(fd / "train_whisp_routing_tau.png", dpi=220)
     plt.close(fig4)
@@ -632,23 +663,32 @@ def main() -> None:
     print(f"Saved figures under {fd}")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model": model_base.state_dict(),
-            "meta": {
-                "n_outer": model_base.n_outer,
-                "n_inner": model_base.stages[0].n_inner,
-                "d": model_base.d,
-                "encoder_ckpts": [str(x) for x in encoder_ckpts],
-                "tau_start": args.tau_start,
-                "tau_end": args.tau_end,
-                "train_rows": train_rows.cpu(),
-                "val_rows": val_rows.cpu(),
-                "test_rows": test_rows.cpu(),
-            },
-        },
-        args.out,
-    )
+    if is_mlp:
+        meta: dict = {
+            "arch": "cst_mlp",
+            "csv": str(args.csv.resolve()),
+            "tau_start": args.tau_start,
+            "tau_end": args.tau_end,
+            "train_rows": train_rows.cpu(),
+            "val_rows": val_rows.cpu(),
+            "test_rows": test_rows.cpu(),
+        }
+    else:
+        whisp = model_base
+        assert isinstance(whisp, WHISP)
+        meta = {
+            "arch": "whisp",
+            "n_outer": whisp.n_outer,
+            "n_inner": whisp.stages[0].n_inner,
+            "d": whisp.d,
+            "encoder_ckpts": [str(x) for x in encoder_ckpts],
+            "tau_start": args.tau_start,
+            "tau_end": args.tau_end,
+            "train_rows": train_rows.cpu(),
+            "val_rows": val_rows.cpu(),
+            "test_rows": test_rows.cpu(),
+        }
+    torch.save({"model": model_base.state_dict(), "meta": meta}, args.out)
     print(f"Saved -> {args.out}")
 
 

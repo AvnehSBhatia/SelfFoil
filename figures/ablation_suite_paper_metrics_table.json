@@ -1,0 +1,173 @@
+[
+  {
+    "model": "loss/reference",
+    "category": "loss",
+    "trainable_params": 647,
+    "cst_rmse": 1.100093,
+    "cl_rmse": 0.846104,
+    "cst_abs_p95": NaN,
+    "paper_rank_index": 0.0
+  },
+  {
+    "model": "numerics/reference",
+    "category": "numerics",
+    "trainable_params": 647,
+    "cst_rmse": 1.100093,
+    "cl_rmse": 0.846104,
+    "cst_abs_p95": NaN,
+    "paper_rank_index": 0.0
+  },
+  {
+    "model": "numerics/simpson",
+    "category": "numerics",
+    "trainable_params": 647,
+    "cst_rmse": 1.079475,
+    "cl_rmse": 0.84728,
+    "cst_abs_p95": NaN,
+    "paper_rank_index": 0.0
+  },
+  {
+    "model": "physics/no_bl",
+    "category": "physics",
+    "trainable_params": 647,
+    "cst_rmse": 1.07184,
+    "cl_rmse": 0.000128,
+    "cst_abs_p95": NaN,
+    "paper_rank_index": 0.0
+  },
+  {
+    "model": "physics/no_circulation",
+    "category": "physics",
+    "trainable_params": 647,
+    "cst_rmse": 1.012108,
+    "cl_rmse": 0.847258,
+    "cst_abs_p95": NaN,
+    "paper_rank_index": 0.0
+  },
+  {
+    "model": "physics/reference",
+    "category": "physics",
+    "trainable_params": 647,
+    "cst_rmse": 1.100093,
+    "cl_rmse": 0.846104,
+    "cst_abs_p95": NaN,
+    "paper_rank_index": 0.0
+  },
+  {
+    "model": "interaction/linear_only",
+    "category": "interaction",
+    "trainable_params": 647,
+    "cst_rmse": 0.230231,
+    "cl_rmse": 0.027682,
+    "cst_abs_p95": 0.433407,
+    "paper_rank_index": 3.0
+  },
+  {
+    "model": "baseline/no_delta",
+    "category": "baseline",
+    "trainable_params": 647,
+    "cst_rmse": 0.242286,
+    "cl_rmse": 0.036023,
+    "cst_abs_p95": 0.462518,
+    "paper_rank_index": 8.0
+  },
+  {
+    "model": "loss/geo_only",
+    "category": "loss",
+    "trainable_params": 647,
+    "cst_rmse": 0.237319,
+    "cl_rmse": 7.603835,
+    "cst_abs_p95": 0.448611,
+    "paper_rank_index": 16.0
+  },
+  {
+    "model": "baseline/full",
+    "category": "baseline",
+    "trainable_params": 647,
+    "cst_rmse": 0.253862,
+    "cl_rmse": 0.924336,
+    "cst_abs_p95": 0.492662,
+    "paper_rank_index": 18.0
+  },
+  {
+    "model": "iteration/single_pass",
+    "category": "iteration",
+    "trainable_params": 1989,
+    "cst_rmse": 0.247398,
+    "cl_rmse": 0.924942,
+    "cst_abs_p95": 0.475586,
+    "paper_rank_index": 18.0
+  },
+  {
+    "model": "encoder/finetune",
+    "category": "encoder",
+    "trainable_params": 743,
+    "cst_rmse": 0.249533,
+    "cl_rmse": 0.924942,
+    "cst_abs_p95": 0.481737,
+    "paper_rank_index": 19.0
+  },
+  {
+    "model": "delta/reference",
+    "category": "delta",
+    "trainable_params": 647,
+    "cst_rmse": 0.253862,
+    "cl_rmse": 0.924336,
+    "cst_abs_p95": 0.492662,
+    "paper_rank_index": 21.0
+  },
+  {
+    "model": "baseline/no_routing",
+    "category": "baseline",
+    "trainable_params": 647,
+    "cst_rmse": 0.251172,
+    "cl_rmse": 0.924943,
+    "cst_abs_p95": 0.486303,
+    "paper_rank_index": 23.0
+  },
+  {
+    "model": "encoder/frozen",
+    "category": "encoder",
+    "trainable_params": 647,
+    "cst_rmse": 0.253862,
+    "cl_rmse": 0.924336,
+    "cst_abs_p95": 0.492662,
+    "paper_rank_index": 24.0
+  },
+  {
+    "model": "baseline/no_physics",
+    "category": "baseline",
+    "trainable_params": 3663,
+    "cst_rmse": 0.277856,
+    "cl_rmse": NaN,
+    "cst_abs_p95": 0.546293,
+    "paper_rank_index": 26.0
+  },
+  {
+    "model": "delta/identity_delta",
+    "category": "delta",
+    "trainable_params": 647,
+    "cst_rmse": 0.255091,
+    "cl_rmse": 0.03801,
+    "cst_abs_p95": 0.494915,
+    "paper_rank_index": 27.0
+  },
+  {
+    "model": "interaction/reference",
+    "category": "interaction",
+    "trainable_params": 647,
+    "cst_rmse": 0.253862,
+    "cl_rmse": 0.924336,
+    "cst_abs_p95": 0.492662,
+    "paper_rank_index": 27.0
+  },
+  {
+    "model": "iteration/reference",
+    "category": "iteration",
+    "trainable_params": 647,
+    "cst_rmse": 0.253862,
+    "cl_rmse": 0.924336,
+    "cst_abs_p95": 0.492662,
+    "paper_rank_index": 30.0
+  }
+]

@@ -12,6 +12,43 @@ from .pair_encoder_loaders import pretrained_pair_embedders
 from .whisp_physics import DeltaTransformer, PreDeltaPhysics
 
 
+class CstMLP(nn.Module):
+    """Baseline MLP: (Cl, Cd, Re_log, Mach, alpha) -> CST18 coefficients (5→32→64→18)."""
+
+    def __init__(
+        self,
+        *,
+        in_dim: int = 5,
+        hidden1: int = 32,
+        hidden2: int = 64,
+        cst_dim: int = 18,
+        dropout_p: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden1),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout_p),
+            nn.Linear(hidden1, hidden2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout_p),
+            nn.Linear(hidden2, cst_dim),
+        )
+
+    def forward(
+        self,
+        cl: torch.Tensor,
+        cd: torch.Tensor,
+        re_log: torch.Tensor,
+        mach: torch.Tensor,
+        alpha: torch.Tensor,
+        route_tau: float = 1.0,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        del route_tau  # unused; kept for call-site parity with WHISP.
+        x = torch.stack([cl, cd, re_log, mach, alpha], dim=-1)
+        return self.net(x), {}
+
+
 class InnerBlock(nn.Module):
     """One bilinear + projection + routing residual block (shared 5× per outer stage)."""
 
