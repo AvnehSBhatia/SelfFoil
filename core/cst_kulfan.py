@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def _bernstein_basis(psi: torch.Tensor, degree: int) -> torch.Tensor:
@@ -304,3 +307,41 @@ class CSTDecoder18(nn.Module):
         for b in range(z.shape[0]):
             outs.append(self._decode_single(z[b], x_coords[b]))
         return torch.stack(outs, dim=0)
+
+
+def build_analytic_cst_decoder(models_dir: Path, device: torch.device) -> CSTDecoder18:
+    """Load `first_branch` from `decoder_coords.pt` if present; else default upper (matches training script)."""
+    meta_path = models_dir / "decoder_coords.pt"
+    first_branch: str = "upper"
+    if meta_path.is_file():
+        meta = torch.load(meta_path, map_location="cpu", weights_only=False)
+        if isinstance(meta, dict) and meta.get("first_branch") in ("upper", "lower"):
+            first_branch = str(meta["first_branch"])
+    dec = CSTDecoder18(n_weights_per_side=8, n1=0.5, n2=1.0, first_branch=first_branch)
+    return dec.to(device).eval()
+
+
+def coord_geo_loss_from_cst(
+    decoder: CSTDecoder18,
+    cst_pred: torch.Tensor,
+    coords_gt_flat: torch.Tensor,
+    *,
+    loss: str,
+    huber_delta: float,
+) -> torch.Tensor:
+    """Geometry loss in flattened (x,y) space after analytic CST decode (not coefficient MAE)."""
+    if cst_pred.ndim != 2 or cst_pred.shape[-1] != 18:
+        raise ValueError(f"Expected cst_pred (B, 18), got {tuple(cst_pred.shape)}")
+    bsz = cst_pred.shape[0]
+    if coords_gt_flat.shape[0] != bsz:
+        raise ValueError("Batch size mismatch between cst_pred and coords_gt_flat.")
+    if coords_gt_flat.shape[1] % 2 != 0:
+        raise ValueError("coords_gt_flat must have an even last dim (x,y pairs).")
+    n_pts = coords_gt_flat.shape[1] // 2
+    x_grid = coords_gt_flat.view(bsz, n_pts, 2)[:, :, 0].contiguous()
+    pred_flat = decoder(cst_pred, x_grid)
+    if loss == "huber":
+        return F.huber_loss(pred_flat, coords_gt_flat, delta=huber_delta, reduction="mean")
+    if loss == "mae":
+        return (pred_flat - coords_gt_flat).abs().mean()
+    raise ValueError(f"Unknown loss={loss!r} (use 'mae' or 'huber').")

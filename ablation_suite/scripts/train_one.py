@@ -26,6 +26,7 @@ from ablation_suite.catalog import get_spec
 from ablation_suite.models.registry import resolve_run_key, run_path_parts
 from ablation_suite.models.whisp_ablated import WHISPAblated
 from core.csv_tensor_cache import load_or_build_cache
+from core.cst_kulfan import build_analytic_cst_decoder, coord_geo_loss_from_cst
 from core.device import configure_cuda_training, resolve_device
 from core.figures_path import figures_dir
 from scripts.train_whisp import (
@@ -121,8 +122,18 @@ def main() -> None:
     )
     p.add_argument("--lr-schedule", default="cosine", choices=["none", "cosine", "onecycle"], help="Dynamic LR schedule")
     p.add_argument("--lr-min-factor", type=float, default=0.1, help="Min LR as a fraction of base LR for cosine/onecycle")
-    p.add_argument("--geo-loss", default="huber", choices=["mae", "huber"], help="Geometry loss type")
-    p.add_argument("--huber-delta", type=float, default=0.02, help="Huber delta for geometry loss")
+    p.add_argument(
+        "--geo-loss",
+        default="mae",
+        choices=["mae", "huber"],
+        help="Geometry loss on decoded (x,y) after CST (not coefficient MAE)",
+    )
+    p.add_argument(
+        "--huber-delta",
+        type=float,
+        default=0.02,
+        help="Huber delta when --geo-loss huber (coordinate space)",
+    )
     p.add_argument("--aux-ema-beta", type=float, default=0.98, help="EMA beta for aux loss normalization")
     p.add_argument("--aux-norm-eps", type=float, default=1e-6, help="Epsilon for aux loss normalization")
     p.add_argument("--two-stage", action="store_true", help="Enable two-stage training with early-stop-driven stage switching")
@@ -197,6 +208,7 @@ def main() -> None:
 
     model_base = WHISPAblated(encoder_ckpts, spec).to(device)
     model = maybe_compile_model(model_base, device, enabled=args.compile, backend=args.compile_backend)
+    cst_decoder = build_analytic_cst_decoder(md, device)
     opt = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
     distill_w = float(spec.get("distill_weight", 0.0) or 0.0)
     model_for_meta = model_base
@@ -221,13 +233,16 @@ def main() -> None:
             mach = mach + torch.randn_like(mach) * noise_std
             alpha = alpha + torch.randn_like(alpha) * noise_std
         row = bundle_cpu["polar_row_idx"][idx]
-        cst_tgt = bundle_cpu["cst18"][row].to(device, non_blocking=True)
+        coords_gt = bundle_cpu["coords"][row].to(device, non_blocking=True)
 
         cst_pred, aux = model(cl, cd, re_log, mach, alpha)
-        if args.geo_loss == "huber":
-            l_geo = nn.functional.huber_loss(cst_pred, cst_tgt, delta=args.huber_delta, reduction="mean")
-        else:
-            l_geo = (cst_pred - cst_tgt).abs().mean()
+        l_geo = coord_geo_loss_from_cst(
+            cst_decoder,
+            cst_pred,
+            coords_gt,
+            loss=args.geo_loss,
+            huber_delta=args.huber_delta,
+        )
         parts: dict[str, torch.Tensor] = {"geo": l_geo}
         l_ns_mean = aux["L_ns"] if model_for_meta.use_physics else torch.tensor(0.0, device=device)
         parts["ns"] = l_ns_mean
@@ -390,7 +405,7 @@ def main() -> None:
         )
         print(
             f"epoch {ep + 1}/{args.epochs}{(' stage=' + stage) if args.two_stage else ''} aux={aux_scale:.2f} train_loss={run_loss:.5e} "
-            f"val_loss={v_loss:.5e} val_geo_mae={v_geo:.5e} lr={opt.param_groups[0]['lr']:.3e}"
+            f"val_loss={v_loss:.5e} val_coord_mae={v_geo:.5e} lr={opt.param_groups[0]['lr']:.3e}"
         )
         monitor_val = v_geo if args.early_stop_monitor == "val_geo" else v_loss
         monitor_hist.append(float(monitor_val))
@@ -503,7 +518,7 @@ def main() -> None:
     axes[0].set_ylabel("loss")
     axes[0].legend(loc="upper right", fontsize=8)
     axes[0].set_title(f"WHISP ablation train/val — {run_key}")
-    axes[1].plot(ep, [h["val_geo_mae"] for h in history], color="C2", label="val CST MAE")
+    axes[1].plot(ep, [h["val_geo_mae"] for h in history], color="C2", label="val coord MAE (post-CST)")
     axes[1].set_xlabel("epoch")
     axes[1].set_ylabel("val geo MAE")
     axes[1].legend(loc="upper right", fontsize=8)

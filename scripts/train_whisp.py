@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Train WHISP: (Cl, Cd, Re, Mach, alpha) -> CST18 using frozen pair encoders + stabilized physics losses."""
+"""Train WHISP: (Cl, Cd, Re, Mach, alpha) -> CST18 using frozen pair encoders + stabilized physics losses.
+
+Geometry loss is MAE (or Huber) on flattened airfoil coordinates after analytic CST decode, not MAE on CST coefficients.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +24,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.csv_tensor_cache import load_or_build_cache
+from core.cst_kulfan import build_analytic_cst_decoder, coord_geo_loss_from_cst
 from core.device import configure_cuda_training, resolve_device
 from core.figures_path import figures_dir
 from core.whisp_net import WHISP
@@ -76,6 +80,7 @@ def required_bundle_keys() -> set[str]:
         "mach_flat",
         "re_log_flat",
         "polar_row_idx",
+        "coords",
         "cst18",
         "polar_ptr",
         "total_polar",
@@ -267,8 +272,18 @@ def main() -> None:
     )
     p.add_argument("--lr-schedule", default="cosine", choices=["none", "cosine", "onecycle"], help="Dynamic LR schedule")
     p.add_argument("--lr-min-factor", type=float, default=0.1, help="Min LR as a fraction of base LR for cosine/onecycle")
-    p.add_argument("--geo-loss", default="huber", choices=["mae", "huber"], help="Geometry loss type")
-    p.add_argument("--huber-delta", type=float, default=0.02, help="Huber delta for geometry loss")
+    p.add_argument(
+        "--geo-loss",
+        default="mae",
+        choices=["mae", "huber"],
+        help="Geometry loss on decoded (x,y) coords after CST (not coefficient space)",
+    )
+    p.add_argument(
+        "--huber-delta",
+        type=float,
+        default=0.02,
+        help="Huber delta when --geo-loss huber (coordinate space)",
+    )
     p.add_argument("--aux-ema-beta", type=float, default=0.98, help="EMA beta for aux loss normalization")
     p.add_argument("--aux-norm-eps", type=float, default=1e-6, help="Epsilon for aux loss normalization")
     p.add_argument("--two-stage", action="store_true", help="Enable two-stage training with early-stop-driven stage switching")
@@ -314,6 +329,7 @@ def main() -> None:
 
     model_base = WHISP(encoder_ckpts=encoder_ckpts, dropout_p=args.dropout_start).to(device)
     model = maybe_compile_model(model_base, device, enabled=args.compile, backend=args.compile_backend)
+    cst_decoder = build_analytic_cst_decoder(md, device)
     last_k = model_base.n_outer - 1
     ema_ns = torch.tensor(1.0, device=device)
     ema_clg = torch.tensor(1.0, device=device)
@@ -330,13 +346,16 @@ def main() -> None:
         mach = _fetch_batch(bundle_cpu, idx, "mach_flat", device)
         alpha = _fetch_batch(bundle_cpu, idx, "alpha_flat", device)
         row = bundle_cpu["polar_row_idx"][idx]
-        cst_tgt = bundle_cpu["cst18"][row].to(device, non_blocking=True)
+        coords_gt = bundle_cpu["coords"][row].to(device, non_blocking=True)
 
         cst_pred, aux = model(cl, cd, re_log, mach, alpha, route_tau=route_tau)
-        if args.geo_loss == "huber":
-            l_geo = nn.functional.huber_loss(cst_pred, cst_tgt, delta=args.huber_delta, reduction="mean")
-        else:
-            l_geo = (cst_pred - cst_tgt).abs().mean()
+        l_geo = coord_geo_loss_from_cst(
+            cst_decoder,
+            cst_pred,
+            coords_gt,
+            loss=args.geo_loss,
+            huber_delta=args.huber_delta,
+        )
         l_ns = aux["L_ns"]
         l_cl_g = nn.functional.mse_loss(aux[f"cl_gamma_{last_k}"], cl)
         l_cl_d = nn.functional.mse_loss(aux["cl_direct"], cl)
@@ -485,7 +504,7 @@ def main() -> None:
         print(
             f"epoch {ep + 1}/{args.epochs}{phase_tag}  τ={tau:.3f} aux={aux_scale:.2f}  train_loss={run_loss:.5e}  "
             f"[geo={run_parts['geo']:.4e} ns={run_parts['ns']:.4e} clg={run_parts['clg']:.4e} cld={run_parts['cld']:.4e}]  "
-            f"val_loss={v_loss:.5e} val_geo_mae={v_geo:.5e} lr={opt.param_groups[0]['lr']:.3e}"
+            f"val_loss={v_loss:.5e} val_coord_mae={v_geo:.5e} lr={opt.param_groups[0]['lr']:.3e}"
         )
         hist_train_loss.append(run_loss)
         hist_val_loss.append(v_loss)
@@ -576,11 +595,11 @@ def main() -> None:
     plt.close(fig1)
 
     fig2, ax2 = plt.subplots(figsize=(8, 4.5))
-    ax2.plot(ep_axis, hist_val_geo, color="C2", label="val CST MAE (geo)")
+    ax2.plot(ep_axis, hist_val_geo, color="C2", label="val coord MAE (post-CST decode)")
     ax2.set_xlabel("epoch")
     ax2.set_ylabel("MAE")
     ax2.legend()
-    ax2.set_title("WHISP validation CST error")
+    ax2.set_title("WHISP validation geometry (coordinate MAE)")
     fig2.tight_layout()
     fig2.savefig(fd / "train_whisp_val_cst_mae.png", dpi=220)
     plt.close(fig2)
