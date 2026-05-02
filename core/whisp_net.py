@@ -13,28 +13,23 @@ from .whisp_physics import DeltaTransformer, PreDeltaPhysics
 
 class CstStruct32(nn.Module):
     """
-    32-parameter inverse head: uses **Cl, Cd, AoA, log10(Re)** only (``mach`` is ignored for API parity).
+    Inverse head using **Cl, Cd, AoA, log10(Re)** only (``mach`` is ignored for API parity).
 
-    Outer product (2,) ⊗ (2,) → (2×2), three residual blocks with learned (2×2) matmul + scalar bias;
-    flatten → Linear(4→1); concat with flat → (5,); two learned (5,) gates; build (15,) then append three
-    “first-of-block” scalars → (18,); three shared residual tanh blocks (scalar scale + bias).
+    Outer product (2,) ⊗ (2,) → (2×2); **10** residual updates ``M ← M + tanh(W_k @ M + b_k)``
+    with learned ``W_k ∈ ℝ²ˣ²`` and scalar ``b_k``; row-major flatten to **1×4**; **Linear(4 → 18)** to CST.
+    Trainable count: 10×(4+1) + (4×18+18) = **140**.
     """
+
+    _N_BLOCKS: int = 10
 
     def __init__(self, *, cst_dim: int = 18) -> None:
         super().__init__()
         if cst_dim != 18:
             raise ValueError("CstStruct32 is fixed to CST18 outputs.")
-        # 3 × (4 matrix + 1 scalar bias) = 15
-        self.W = nn.Parameter(torch.stack([torch.eye(2) + 0.01 * torch.randn(2, 2) for _ in range(3)]))
-        self.b_block = nn.Parameter(torch.zeros(3))
-        # 4→1 projection (dot + bias) = 5
-        self.proj4 = nn.Linear(4, 1)
-        # two 5×1 dot gates = 10
-        self.w_gate1 = nn.Parameter(torch.randn(5) * 0.02)
-        self.w_gate2 = nn.Parameter(torch.randn(5) * 0.02)
-        # shared final residual (applied 3×) = 2
-        self.final_scale = nn.Parameter(torch.tensor(1.0))
-        self.final_bias = nn.Parameter(torch.tensor(0.0))
+        n = self._N_BLOCKS
+        self.W = nn.Parameter(torch.stack([torch.eye(2) + 0.01 * torch.randn(2, 2) for _ in range(n)]))
+        self.b_block = nn.Parameter(torch.zeros(n))
+        self.head = nn.Linear(4, cst_dim)
 
     def forward(
         self,
@@ -48,23 +43,13 @@ class CstStruct32(nn.Module):
         del mach, route_tau
         v1 = torch.stack([cl, cd], dim=-1)
         v2 = torch.stack([alpha, re_log], dim=-1)
-        # Rows = Cl, Cd; cols = AoA, Re_log — M[i,j] = v1[i] * v2[j]
         m = v1.unsqueeze(-1) * v2.unsqueeze(-2)
-        for k in range(3):
+        for k in range(self._N_BLOCKS):
             step = torch.einsum("ij,bjk->bik", self.W[k], m)
             step = step + self.b_block[k]
             m = m + torch.tanh(step)
         flat = m.reshape(m.shape[0], 4)
-        s = self.proj4(flat)
-        u = torch.cat([s, flat], dim=-1)
-        s0 = torch.tanh((u * self.w_gate1).sum(dim=-1, keepdim=True))
-        s1 = torch.tanh((u * self.w_gate2).sum(dim=-1, keepdim=True))
-        ext = torch.cat([u * s0, u * s1, u], dim=-1)
-        firsts = torch.stack([ext[:, 0], ext[:, 5], ext[:, 10]], dim=-1)
-        v = torch.cat([ext, firsts], dim=-1)
-        for _ in range(3):
-            v = v + torch.tanh(self.final_scale * v + self.final_bias)
-        return v, {}
+        return self.head(flat), {}
 
 
 class CstMLP(nn.Module):

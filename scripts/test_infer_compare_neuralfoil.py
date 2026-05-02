@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Interactive test utility: infer airfoil from (Cl, Cd, Re, Mach, AoA), compare with NeuralFoil polars."""
+"""Interactive test utility: infer airfoil from (Cl, Cd, Re, Mach, AoA), compare with NeuralFoil polars.
+
+Loads checkpoints via ``meta["arch"]``:
+
+- ``cst_struct32``: ``CstStruct32`` — uses **Cl, Cd, AoA, log10(Re)** only; **Mach is ignored** for inference
+  (still pass ``--mach`` for NeuralFoil polars on the decoded geometry).
+- ``cst_mlp``: five-input MLP to CST18.
+- Otherwise: ``WHISPAblated`` (requires ``meta["spec"]`` + encoder ``.pt`` files).
+
+Small CST heads omit ``aux["cl_direct"]``; WHISP ablations include it when present.
+"""
 
 from __future__ import annotations
 
@@ -25,13 +35,20 @@ if str(ROOT) not in sys.path:
 from ablation_suite.models.whisp_ablated import WHISPAblated
 from core.cst_kulfan import CSTDecoder18
 from core.figures_path import figures_dir
+from core.whisp_net import CstMLP, CstStruct32
 
 
 def _default_checkpoint() -> Path:
-    candidates = sorted((ROOT / "ablation_suite" / "runs").glob("*/*/model.pt"))
-    if not candidates:
-        raise FileNotFoundError("No checkpoints found under ablation_suite/runs/*/*/model.pt")
-    return candidates[0]
+    runs = sorted((ROOT / "ablation_suite" / "runs").glob("*/*/model.pt"))
+    if runs:
+        return runs[0]
+    for path in (ROOT / "models" / "cst_struct32.pt", ROOT / "models" / "cst_mlp.pt"):
+        if path.is_file():
+            return path
+    raise FileNotFoundError(
+        "No checkpoint: install ablation_suite/runs/*/*/model.pt or models/cst_struct32.pt / cst_mlp.pt "
+        "or pass --checkpoint explicitly."
+    )
 
 
 def _resolve_encoder_ckpts(meta: dict[str, Any], root: Path) -> tuple[Path, ...]:
@@ -86,15 +103,39 @@ def _load_decoder_first_branch(meta_path: Path) -> str:
     return "upper"
 
 
-def _load_model(ckpt_path: Path, device: torch.device) -> WHISPAblated:
+def _load_inverse_checkpoint(
+    ckpt_path: Path, device: torch.device
+) -> tuple[torch.nn.Module, str, str]:
+    """Returns ``(model, label_for_plots, arch_slug)`` where ``arch_slug`` is normalized ``meta['arch']``."""
     blob = torch.load(ckpt_path, map_location=device, weights_only=False)
     meta = blob["meta"]
+    arch_raw = str(meta.get("arch", "")).lower().replace("-", "_")
+    if arch_raw == "cst_mlp":
+        model = CstMLP().to(device)
+        model.load_state_dict(blob["model"])
+        model.eval()
+        try:
+            rid = str(ckpt_path.resolve().relative_to(ROOT.resolve())).replace("\\", "/")
+        except ValueError:
+            rid = ckpt_path.name
+        return model, rid, "cst_mlp"
+    if arch_raw == "cst_struct32":
+        model = CstStruct32().to(device)
+        model.load_state_dict(blob["model"])
+        model.eval()
+        try:
+            rid = str(ckpt_path.resolve().relative_to(ROOT.resolve())).replace("\\", "/")
+        except ValueError:
+            rid = ckpt_path.name
+        return model, rid, "cst_struct32"
     spec = meta["spec"]
     encoder_ckpts = _resolve_encoder_ckpts(meta, ROOT)
     model = WHISPAblated(encoder_ckpts, spec).to(device)
     model.load_state_dict(blob["model"])
     model.eval()
-    return model
+    model_id = f"{ckpt_path.parent.parent.name}/{ckpt_path.parent.name}"
+    arch_slug = arch_raw if arch_raw else "whisp_ablated"
+    return model, model_id, arch_slug
 
 
 def _try_neuralfoil_import() -> Any:
@@ -154,12 +195,22 @@ def _run_neuralfoil_polars(
 @torch.no_grad()
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint", type=Path, default=None)
+    p.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="WHISP ablation model.pt, or models/cst_struct32.pt / cst_mlp.pt (default: first ablation run, else models/cst_struct32.pt)",
+    )
     p.add_argument("--device", default="cpu", choices=["cpu", "cuda", "mps", "auto"])
     p.add_argument("--cl", type=float, required=True)
     p.add_argument("--cd", type=float, required=True)
     p.add_argument("--re", type=float, required=True)
-    p.add_argument("--mach", type=float, required=True)
+    p.add_argument(
+        "--mach",
+        type=float,
+        required=True,
+        help="Mach number (always used for NeuralFoil polars; ignored by CstStruct32 inverse pass only).",
+    )
     p.add_argument("--aoa", type=float, required=True, help="AoA in degrees")
     p.add_argument("--alpha-start", type=float, default=-5.0)
     p.add_argument("--alpha-end", type=float, default=15.0)
@@ -182,7 +233,7 @@ def main() -> None:
         device = torch.device(args.device)
 
     checkpoint = args.checkpoint or _default_checkpoint()
-    model = _load_model(checkpoint, device=device)
+    model, model_label, arch_slug = _load_inverse_checkpoint(checkpoint, device=device)
 
     cl_t = torch.tensor([args.cl], dtype=torch.float32, device=device)
     cd_t = torch.tensor([args.cd], dtype=torch.float32, device=device)
@@ -191,7 +242,9 @@ def main() -> None:
     aoa_t = torch.tensor([args.aoa], dtype=torch.float32, device=device)
 
     cst_pred, aux = model(cl_t, cd_t, re_log_t, mach_t, aoa_t)
-    cl_direct = float(aux["cl_direct"][0].detach().cpu().item())
+    cl_direct: float | None = None
+    if isinstance(aux, dict) and "cl_direct" in aux and aux["cl_direct"].numel():
+        cl_direct = float(aux["cl_direct"][0].detach().cpu().item())
     cst = cst_pred[0]
 
     x_1d = _load_x_coords_from_cache(args.x_grid_cache, device=device)
@@ -234,10 +287,12 @@ def main() -> None:
             "aoa_deg": args.aoa,
         },
         "checkpoint": str(checkpoint),
+        "checkpoint_arch": arch_slug,
+        "model_label": model_label,
         "device": str(device),
         "neuralfoil_model_size": args.neuralfoil_model_size,
         "whisp_outputs_at_input": {
-            "cl_direct": cl_direct,
+            **({"cl_direct": cl_direct} if cl_direct is not None else {}),
             "cst18": cst.detach().cpu().tolist(),
         },
         "polar_comparison": {
@@ -254,6 +309,7 @@ def main() -> None:
         json.dump(payload, f, indent=2)
 
     fig, (ax0, ax1, ax2) = plt.subplots(1, 3, figsize=(15, 4.8))
+    fig.suptitle(f"test_infer_compare_neuralfoil — {model_label} ({arch_slug})", fontsize=10, y=1.02)
     ax0.plot(xy[:, 0], xy[:, 1], lw=1.4)
     ax0.set_title("Reconstructed airfoil")
     ax0.set_aspect("equal", adjustable="box")
@@ -262,7 +318,8 @@ def main() -> None:
 
     ax1.plot(alphas, cl_nf, lw=1.5, label="NeuralFoil Cl(alpha)")
     ax1.scatter([args.aoa], [args.cl], s=38, c="C3", marker="x", label="Input target")
-    ax1.scatter([args.aoa], [cl_direct], s=30, c="C2", marker="o", label="WHISP cl_direct")
+    if cl_direct is not None:
+        ax1.scatter([args.aoa], [cl_direct], s=30, c="C2", marker="o", label="Model cl_direct")
     ax1.set_title("Lift polar")
     ax1.set_xlabel("AoA (deg)")
     ax1.set_ylabel("Cl")
@@ -279,6 +336,7 @@ def main() -> None:
     fig.savefig(out_png, dpi=240)
     plt.close(fig)
 
+    print(f"checkpoint_arch={arch_slug} model_label={model_label}")
     print(f"Saved JSON: {out_json}")
     print(f"Saved geometry CSV: {out_geom}")
     print(f"Saved polar figure: {out_png}")
