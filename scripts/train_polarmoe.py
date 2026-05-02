@@ -17,6 +17,7 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -33,11 +34,17 @@ from core.regime_transformer import RegimeConditionedAeroTransformer, fourier_ms
 
 
 @torch.inference_mode()
-def evaluate(model: RegimeConditionedAeroTransformer, loader: DataLoader, dev: torch.device) -> float:
+def evaluate(
+    model: RegimeConditionedAeroTransformer,
+    loader: DataLoader,
+    dev: torch.device,
+    *,
+    desc: str = "val",
+) -> float:
     model.eval()
     pin = dev.type == "cuda"
     total, seen = 0.0, 0
-    for batch in loader:
+    for batch in tqdm(loader, desc=desc, leave=False, unit="batch"):
         batch = polar_batch_to_device(batch, dev, non_blocking=pin)
         y = model(batch["polar"], batch["padding_mask"], batch["lengths"])
         loss = fourier_mse_loss(y, batch["target_fourier"]).item() * batch["polar"].size(0)
@@ -101,26 +108,51 @@ def main() -> None:
         persistent_workers=args.num_workers > 0,
     )
 
+    tqdm.write(
+        f"train rows={len(tr_ds)}  val rows={len(va_ds)}  batches/train={len(tr_load)}  "
+        f"device={dev}"
+    )
+    n_peek = min(args.batch_size, len(tr_ds))
+    peek_rows = [tr_ds[i] for i in range(n_peek)]
+    peek_batch = polar_collate(peek_rows)
+    tf = peek_batch["target_fourier"]
+    tqdm.write(
+        "target_fourier (peek batch): "
+        f"|mean|={tf.abs().mean().item():.4g}  std={tf.std().item():.4g}  "
+        f"min/max={tf.min().item():.4g}/{tf.max().item():.4g}"
+    )
+
     model = RegimeConditionedAeroTransformer().to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     best = float("inf")
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(1, args.epochs + 1):
+    epoch_bar = tqdm(range(1, args.epochs + 1), desc="epochs", unit="epoch")
+    for epoch in epoch_bar:
         model.train()
         run, n = 0.0, 0
-        for batch in tr_load:
+        batch_bar = tqdm(
+            tr_load,
+            desc=f"train e{epoch}/{args.epochs}",
+            leave=False,
+            unit="batch",
+        )
+        for batch in batch_bar:
             batch = polar_batch_to_device(batch, dev, non_blocking=nb)
             opt.zero_grad()
             y = model(batch["polar"], batch["padding_mask"], batch["lengths"])
             loss = fourier_mse_loss(y, batch["target_fourier"])
             loss.backward()
             opt.step()
-            run += loss.item() * batch["polar"].size(0)
-            n += batch["polar"].size(0)
+            bs = batch["polar"].size(0)
+            li = loss.item()
+            run += li * bs
+            n += bs
+            batch_bar.set_postfix(loss=f"{li:.4e}", avg=f"{run / max(n, 1):.4e}")
         tr_mse = run / max(n, 1)
-        val_mse = evaluate(model, va_load, dev)
-        print(f"epoch {epoch}  train MSE {tr_mse:.6e}  val MSE {val_mse:.6e}")
+        val_mse = evaluate(model, va_load, dev, desc=f"val e{epoch}/{args.epochs}")
+        epoch_bar.set_postfix(train_mse=f"{tr_mse:.4e}", val_mse=f"{val_mse:.4e}")
+        tqdm.write(f"epoch {epoch}/{args.epochs}  train MSE {tr_mse:.6e}  val MSE {val_mse:.6e}")
         if val_mse < best:
             best = val_mse
             torch.save(
@@ -132,7 +164,8 @@ def main() -> None:
                 },
                 args.out,
             )
-    print(f"best val MSE {best:.6e} → saved {args.out}")
+            tqdm.write(f"  → saved best val MSE {best:.6e} to {args.out}")
+    tqdm.write(f"best val MSE {best:.6e} → saved {args.out}")
 
 
 if __name__ == "__main__":
