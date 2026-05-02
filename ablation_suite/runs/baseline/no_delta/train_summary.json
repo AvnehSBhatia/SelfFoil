@@ -1,6 +1,0 @@
-{
-"run_id": "baseline/no_delta",
-"epoch": 80,
-"final_val_geo_mae": 0.0062216464430093765,
-"convergence_epoch_val_geo_mae_below_0.02": 1
-}

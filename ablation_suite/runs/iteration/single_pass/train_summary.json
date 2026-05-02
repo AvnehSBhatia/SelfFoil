@@ -1,6 +1,0 @@
-{
-"run_id": "iteration/single_pass",
-"epoch": 80,
-"final_val_geo_mae": 0.005917727015912533,
-"convergence_epoch_val_geo_mae_below_0.02": 1
-}

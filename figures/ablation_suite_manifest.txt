@@ -1,2 +1,0 @@
-catalog_runs=59 evaluated=19
-generated=overview,category,convergence,error_vs_size,landscape,pareto,delta_vs_reference,paper_table
