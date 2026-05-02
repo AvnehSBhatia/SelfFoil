@@ -21,7 +21,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .constants import POLAR_CL, POLAR_DIM
+from .constants import POLAR_CL
+from .polar_token_embedding import PolarTokenEmbedding
 
 D_MODEL = 16
 N_EXPERTS = 5
@@ -239,7 +240,7 @@ class PolarVotingMoETransformer(nn.Module):
         if d_model % nhead != 0:
             raise ValueError("d_model must be divisible by nhead")
         self.d_model = d_model
-        self.embed = nn.Linear(POLAR_DIM, d_model)
+        self.polar_token_embed = PolarTokenEmbedding(d_latent=d_model)
         self.stages = nn.ModuleList(
             [MacroDuplicatedStage(d_model, nhead, ffn_dim, dropout) for _ in range(n_stages)]
         )
@@ -252,10 +253,22 @@ class PolarVotingMoETransformer(nn.Module):
             nn.Linear(32, 50),
         )
 
+    def load_state_dict(self, state_dict: dict, strict: bool = True):  # type: ignore[override]
+        if any(str(k).startswith("embed.") for k in state_dict):
+            remap = {}
+            for k, v in state_dict.items():
+                ks = str(k)
+                if ks.startswith("embed."):
+                    remap["polar_token_embed.proj." + ks[len("embed.") :]] = v
+                else:
+                    remap[k] = v
+            state_dict = remap
+        return super().load_state_dict(state_dict, strict=strict)
+
     def forward(
         self, polar: torch.Tensor, key_padding_mask: torch.Tensor, lengths: torch.Tensor
     ) -> torch.Tensor:
-        h = self.embed(polar)
+        h = self.polar_token_embed(polar)
         for st in self.stages:
             h = st(h, polar, key_padding_mask, lengths)
         h = self.final_block(h, key_padding_mask)

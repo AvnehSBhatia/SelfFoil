@@ -1,4 +1,4 @@
-"""Arc-length Fourier embedding: 250 × 2 coordinates ↔ 50 real coefficients."""
+"""Analytic Fourier packing of Cartesian coordinates ↔ 50 real coefficients (NOT polar 5→16 `E(x)`)."""
 
 from __future__ import annotations
 

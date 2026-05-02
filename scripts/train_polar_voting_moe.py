@@ -12,7 +12,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from core.dataset import PolarAirfoilDataset, polar_collate_fn
+from core.airfoil_embedding import AirfoilFourierEmbedding
+from core.dataset import PolarAirfoilDataset, make_polar_collate_fn
 from core.polar_voting_moe import PolarVotingMoETransformer, fourier_mse_loss
 
 
@@ -51,8 +52,10 @@ def main() -> None:
         raise SystemExit(f"Missing {args.val}")
 
     dev = torch.device(args.device)
-    tr_ds = PolarAirfoilDataset(args.train, max_rows=args.max_train_rows)
-    va_ds = PolarAirfoilDataset(args.val, max_rows=args.max_val_rows)
+    fourier = AirfoilFourierEmbedding()
+    polar_collate_fn = make_polar_collate_fn(fourier)
+    tr_ds = PolarAirfoilDataset(args.train, max_rows=args.max_train_rows, fourier_engine=fourier)
+    va_ds = PolarAirfoilDataset(args.val, max_rows=args.max_val_rows, fourier_engine=fourier)
     if len(tr_ds) == 0 or len(va_ds) == 0:
         raise SystemExit("Empty train or val dataset.")
 

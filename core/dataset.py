@@ -137,8 +137,10 @@ def make_polar_collate_fn(
 
 class CoordFourierSupervisedDataset(Dataset):
     """
-    For neural embedding pretraining: ``coords (250,2)`` and analytic Fourier target ``(50,)``.
-    Same CSV format as :class:`PolarAirfoilDataset`.
+    Optional coordinate→Fourier supervision: raw ``coords (250,2)`` rows and FFT targets ``(50,)``.
+
+    For the polar ``5 → 16`` token map, see :class:`~core.polar_token_embedding.PolarTokenEmbedding`
+    (trained inside the main polar Transformer, not here).
     """
 
     def __init__(
