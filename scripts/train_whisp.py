@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Train inverse models (Cl, Cd, Re, Mach, alpha) -> CST18.
 
-WHISP uses frozen pair encoders plus auxiliary physics losses. ``--arch cst-mlp`` trains a
-small MLP (5→32→64→18) on geometry loss only (no encoders or aux terms).
+WHISP uses frozen pair encoders plus auxiliary physics losses. ``--arch cst-mlp`` (wide MLP)
+and ``--arch cst-handcrafted7`` (7-scalar handcrafted map) train geometry-only CST heads without encoders.
 
 Geometry loss is MAE (or Huber) on flattened airfoil coordinates after analytic CST decode, not MAE on CST coefficients.
 """
@@ -30,7 +30,13 @@ from core.csv_tensor_cache import load_or_build_cache
 from core.cst_kulfan import build_analytic_cst_decoder, coord_geo_loss_from_cst
 from core.device import configure_cuda_training, resolve_device
 from core.figures_path import figures_dir
-from core.whisp_net import CstMLP, WHISP
+from core.whisp_net import CstHandcrafted7, CstMLP, WHISP
+
+_GEOM_ONLY_ARCHS = frozenset({"cst-mlp", "cst-handcrafted7"})
+_DEFAULT_OUT_FOR_ARCH: dict[str, Path] = {
+    "cst-mlp": ROOT / "models" / "cst_mlp.pt",
+    "cst-handcrafted7": ROOT / "models" / "cst_handcrafted7.pt",
+}
 
 
 def move_bundle(bundle: dict, device: torch.device) -> dict:
@@ -227,8 +233,8 @@ def main() -> None:
     p.add_argument(
         "--arch",
         default="whisp",
-        choices=["whisp", "cst-mlp"],
-        help="whisp: encoder stack + iterative core; cst-mlp: 5→32→64→18 MLP, geometry loss only",
+        choices=["whisp", "cst-mlp", "cst-handcrafted7"],
+        help="whisp: encoder stack + iterative core; cst-mlp / cst-handcrafted7: geometry-only CST heads",
     )
     p.add_argument("--csv", type=Path, default=ROOT / "data" / "original.csv")
     p.add_argument("--cache", type=Path, default=ROOT / "models" / "original_tensors.pt")
@@ -250,7 +256,7 @@ def main() -> None:
         "--out",
         type=Path,
         default=None,
-        help="Checkpoint path (default: models/whisp.pt or models/cst_mlp.pt from --arch)",
+        help="Checkpoint path (default: models/whisp.pt or models/cst_{mlp,handcrafted7}.pt from --arch)",
     )
     p.add_argument("--models-dir", type=Path, default=ROOT / "models", help="Directory with encoder_*.pt from train_autoencoders")
     p.add_argument("--enc-cl", type=Path, default=None)
@@ -307,10 +313,10 @@ def main() -> None:
     p.add_argument("--stage1-aux-scale", type=float, default=0.1, help="Aux scale used in geometry stage")
     p.add_argument("--stage2-aux-scale", type=float, default=1.0, help="Aux scale used in auxiliary stage")
     args = p.parse_args()
-    is_mlp = args.arch == "cst-mlp"
+    is_geom_only = args.arch in _GEOM_ONLY_ARCHS
     if args.out is None:
-        args.out = ROOT / "models" / ("cst_mlp.pt" if is_mlp else "whisp.pt")
-    if is_mlp and args.two_stage:
+        args.out = _DEFAULT_OUT_FOR_ARCH.get(args.arch, ROOT / "models" / "whisp.pt")
+    if is_geom_only and args.two_stage:
         raise SystemExit("--two-stage is only supported with --arch whisp")
 
     device = resolve_device(args.device)
@@ -321,7 +327,7 @@ def main() -> None:
     enc_re = args.enc_re or md / "encoder_re_alpha.pt"
     enc_mach = args.enc_mach or md / "encoder_mach_alpha.pt"
     encoder_ckpts = (enc_cl, enc_cd, enc_re, enc_mach)
-    if not is_mlp:
+    if not is_geom_only:
         for path in encoder_ckpts:
             if not path.is_file():
                 raise SystemExit(
@@ -349,8 +355,10 @@ def main() -> None:
     if train_idx.numel() == 0 or val_idx.numel() == 0:
         raise SystemExit("Empty train or val polar split; adjust fractions or dataset size.")
 
-    if is_mlp:
+    if args.arch == "cst-mlp":
         model_base = CstMLP(dropout_p=args.dropout_start).to(device)
+    elif args.arch == "cst-handcrafted7":
+        model_base = CstHandcrafted7().to(device)
     else:
         model_base = WHISP(encoder_ckpts=encoder_ckpts, dropout_p=args.dropout_start).to(device)
     model = maybe_compile_model(model_base, device, enabled=args.compile, backend=args.compile_backend)
@@ -381,7 +389,7 @@ def main() -> None:
             loss=args.geo_loss,
             huber_delta=args.huber_delta,
         )
-        if is_mlp:
+        if is_geom_only:
             z = torch.zeros((), device=device, dtype=l_geo.dtype)
             parts = {"geo": l_geo, "ns": z, "clg": z, "cld": z}
             return l_geo, parts
@@ -404,10 +412,10 @@ def main() -> None:
         parts = {"geo": l_geo, "ns": l_ns, "clg": l_cl_g, "cld": l_cl_d}
         return loss, parts
 
-    arch_label = "CstMLP" if is_mlp else "WHISP"
+    arch_label = {"cst-mlp": "CstMLP", "cst-handcrafted7": "CstHandcrafted7"}.get(args.arch, "WHISP")
     print(f"Device={device} | arch={args.arch} | train polar={train_idx.numel()} val polar={val_idx.numel()} | rows={n_rows}")
     n_trainable = sum(x.numel() for x in model_base.parameters() if x.requires_grad)
-    enc_note = "" if is_mlp else " (pair encoders frozen)"
+    enc_note = "" if is_geom_only else " (pair encoders frozen)"
     print(f"{arch_label} trainable parameters: {n_trainable}{enc_note}")
     total_train_batches = train_batch_count(train_idx.numel(), args.batch, args.max_train_batches)
     total_val_batches = train_batch_count(val_idx.numel(), args.batch, args.max_val_batches)
@@ -663,9 +671,19 @@ def main() -> None:
     print(f"Saved figures under {fd}")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    if is_mlp:
-        meta: dict = {
+    if args.arch == "cst-mlp":
+        meta = {
             "arch": "cst_mlp",
+            "csv": str(args.csv.resolve()),
+            "tau_start": args.tau_start,
+            "tau_end": args.tau_end,
+            "train_rows": train_rows.cpu(),
+            "val_rows": val_rows.cpu(),
+            "test_rows": test_rows.cpu(),
+        }
+    elif args.arch == "cst-handcrafted7":
+        meta = {
+            "arch": "cst_handcrafted7",
             "csv": str(args.csv.resolve()),
             "tau_start": args.tau_start,
             "tau_end": args.tau_end,

@@ -7,9 +7,70 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .pair_encoder_loaders import pretrained_pair_embedders
 from .whisp_physics import DeltaTransformer, PreDeltaPhysics
+
+
+class CstHandcrafted7(nn.Module):
+    """
+    7 trainable scalars: one ``a`` (input scale + output scale), six group scales for 18/3 column triplets.
+
+    Pipeline: scale inputs by ``a``; per-coordinate nonlinearities (GELU, tanh, sigmoid, exp, log∘ReLU);
+    build (B,5,18) from x_raw ⊗ z (row-wise product, replicated across 18 columns); scale each triplet of
+    columns by its learned scalar; within each triplet apply tanh / ReLU / softmax along the 5 rows;
+    sum over rows → (B,18); tanh and scale by ``a`` for CST coefficients.
+    """
+
+    _EXP_CLAMP: float = 20.0
+
+    def __init__(self, *, cst_dim: int = 18, log_eps: float = 1e-6) -> None:
+        super().__init__()
+        if cst_dim % 3 != 0:
+            raise ValueError("cst_dim must be divisible by 3 for triplet column blocks.")
+        self.cst_dim = cst_dim
+        self.n_groups = cst_dim // 3
+        if self.n_groups != 6:
+            raise ValueError("Expected cst_dim=18 (six groups of three columns).")
+        self.log_eps = log_eps
+        self.a = nn.Parameter(torch.tensor(1.0))
+        self.group_scale = nn.Parameter(torch.ones(self.n_groups))
+
+    def forward(
+        self,
+        cl: torch.Tensor,
+        cd: torch.Tensor,
+        re_log: torch.Tensor,
+        mach: torch.Tensor,
+        alpha: torch.Tensor,
+        route_tau: float = 1.0,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        del route_tau
+        x_raw = torch.stack([cl, cd, re_log, mach, alpha], dim=-1)
+        s = self.a * x_raw
+        z0 = F.gelu(s[..., 0])
+        z1 = torch.tanh(s[..., 1])
+        z2 = torch.sigmoid(s[..., 2])
+        z3 = torch.exp(torch.clamp(s[..., 3], max=self._EXP_CLAMP))
+        z4 = torch.log(F.relu(s[..., 4]) + self.log_eps)
+        z = torch.stack([z0, z1, z2, z3, z4], dim=-1)
+
+        # (B, 5, 18): raw_i * z_i replicated across columns
+        hz = (x_raw * z).unsqueeze(-1).expand(-1, -1, self.cst_dim)
+
+        out_cols: list[torch.Tensor] = []
+        for g in range(self.n_groups):
+            block = hz[:, :, 3 * g : 3 * g + 3] * self.group_scale[g]
+            c0 = torch.tanh(block[:, :, 0])
+            c1 = F.relu(block[:, :, 1])
+            c2 = torch.softmax(block[:, :, 2], dim=1)
+            out_cols.extend([c0, c1, c2])
+
+        h_done = torch.stack(out_cols, dim=-1)
+        summed = h_done.sum(dim=1)
+        cst = torch.tanh(summed) * self.a
+        return cst, {}
 
 
 class CstMLP(nn.Module):

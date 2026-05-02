@@ -34,6 +34,7 @@ if str(ROOT) not in sys.path:
 from ablation_suite.models.whisp_ablated import WHISPAblated
 from core.cst_kulfan import CSTDecoder18, fit_cst18_from_xy_batched
 from core.figures_path import figures_dir
+from core.whisp_net import CstHandcrafted7, CstMLP
 
 
 def _default_checkpoint() -> Path:
@@ -99,15 +100,40 @@ def _build_x_coords(n_points_per_side: int, device: torch.device) -> torch.Tenso
     return torch.cat([x_first, x_second], dim=0)
 
 
-def _load_model(ckpt_path: Path, device: torch.device) -> WHISPAblated:
+def _load_inverse_checkpoint(ckpt_path: Path, device: torch.device) -> tuple[torch.nn.Module, str]:
+    """Load WHISPAblated or small CST heads (``cst_mlp``, ``cst_handcrafted7``). Returns (model, display_id)."""
     blob = torch.load(ckpt_path, map_location=device, weights_only=False)
     meta = blob["meta"]
+    arch = str(meta.get("arch", "")).lower().replace("-", "_")
+    if arch == "cst_mlp":
+        model = CstMLP().to(device)
+        model.load_state_dict(blob["model"])
+        model.eval()
+        cpath = ckpt_path.resolve()
+        try:
+            rel = cpath.relative_to(ROOT.resolve())
+            model_id = str(rel).replace("\\", "/")
+        except ValueError:
+            model_id = cpath.name
+        return model, model_id
+    if arch == "cst_handcrafted7":
+        model = CstHandcrafted7().to(device)
+        model.load_state_dict(blob["model"])
+        model.eval()
+        cpath = ckpt_path.resolve()
+        try:
+            rel = cpath.relative_to(ROOT.resolve())
+            model_id = str(rel).replace("\\", "/")
+        except ValueError:
+            model_id = cpath.name
+        return model, model_id
     spec = meta["spec"]
     encoder_ckpts = _resolve_encoder_ckpts(meta, ROOT)
     model = WHISPAblated(encoder_ckpts, spec).to(device)
     model.load_state_dict(blob["model"])
     model.eval()
-    return model
+    model_id = f"{ckpt_path.parent.parent.name}/{ckpt_path.parent.name}"
+    return model, model_id
 
 
 def _try_neuralfoil_import() -> Any:
@@ -157,6 +183,20 @@ def _run_nf_from_airfoil(
     af = asb.Airfoil(airfoil_name)
     out = nf.get_aero_from_airfoil(airfoil=af, alpha=alphas_deg, Re=re, model_size=model_size)  # type: ignore[attr-defined]
     return np.asarray(out["CL"]), np.asarray(out["CD"]), np.asarray(af.coordinates)
+
+
+def _json_sanitize(obj: Any) -> Any:
+    """Replace NaN/inf floats so json.dump(..., allow_nan=False) succeeds."""
+    if isinstance(obj, (float, np.floating)):
+        v = float(obj)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
+    if isinstance(obj, dict):
+        return {str(k): _json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_sanitize(v) for v in obj]
+    return obj
 
 
 def _point_errors(pred: np.ndarray, true: np.ndarray) -> tuple[float, float]:
@@ -297,12 +337,19 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", type=Path, default=None)
     p.add_argument("--all-models", action="store_true", help="Run all checkpoints under ablation_suite/runs/*/*/model.pt")
+    p.add_argument(
+        "--extra-checkpoints",
+        nargs="*",
+        type=Path,
+        default=(),
+        help="Additional checkpoints after discovered ones (e.g. models/cst_mlp.pt).",
+    )
     p.add_argument("--suite-root", type=Path, default=ROOT / "ablation_suite")
     p.add_argument("--device", default="cpu", choices=["cpu", "cuda", "mps", "auto"])
     p.add_argument(
         "--airfoils",
         nargs="+",
-        default=["naca0012", "s1223", "naca2412", "naca4412", "e216", "clarky"],
+        default=["naca0012", "s1223", "e216", "e420", "clarky", "naca2412", "naca4412"],
         help="Named airfoils available through AeroSandbox/NeuralFoil.",
     )
     p.add_argument("--re", type=float, default=1_000_000.0)
@@ -329,11 +376,20 @@ def main() -> None:
 
     checkpoints: list[Path]
     if args.all_models:
-        checkpoints = _discover_checkpoints(args.suite_root)
+        checkpoints = list(_discover_checkpoints(args.suite_root))
         if not checkpoints:
             raise SystemExit(f"No checkpoints found under {args.suite_root / 'runs'}.")
     else:
         checkpoints = [args.checkpoint or _default_checkpoint()]
+    resolved_ckpts = [c.resolve() for c in checkpoints]
+    for p in args.extra_checkpoints:
+        pr = (ROOT / p).resolve() if not p.is_absolute() else p.resolve()
+        if not pr.is_file():
+            print(f"[warn] extra checkpoint missing, skip: {pr}", flush=True)
+            continue
+        if pr not in resolved_ckpts:
+            resolved_ckpts.append(pr)
+            checkpoints.append(pr)
     nf = _try_neuralfoil_import()
 
     x_1d = _load_x_coords_from_cache(args.x_grid_cache, device=device)
@@ -374,8 +430,7 @@ def main() -> None:
         }
 
     for checkpoint in checkpoints:
-        model = _load_model(checkpoint, device=device)
-        model_id = f"{checkpoint.parent.parent.name}/{checkpoint.parent.name}"
+        model, model_id = _load_inverse_checkpoint(checkpoint, device=device)
         for airfoil_name in args.airfoils:
             ref = ref_cache[airfoil_name]
             cl_ref = np.asarray(ref["cl_ref"])
@@ -400,7 +455,10 @@ def main() -> None:
                 cst_pred, aux = model(cl_t, cd_t, re_log_t, mach_t, aoa_t)
                 cst_v = cst_pred[0].detach().cpu().numpy()
                 cst_pred_all.append(cst_v)
-                cl_direct_pred.append(float(aux["cl_direct"][0].detach().cpu().item()))
+                if "cl_direct" in aux and aux["cl_direct"].numel():
+                    cl_direct_pred.append(float(aux["cl_direct"][0].detach().cpu().item()))
+                else:
+                    cl_direct_pred.append(float("nan"))
 
                 xy_flat = decoder(cst_pred, x_coords)[0]
                 xy_pred = xy_flat.view(-1, 2).detach().cpu().numpy()
@@ -420,9 +478,15 @@ def main() -> None:
             cst_pred_np = np.stack(cst_pred_all, axis=0)
             cst_true_rep = np.repeat(cst_true[None, :], cst_pred_np.shape[0], axis=0)
             cst_rmse, cst_mae = _point_errors(cst_pred_np, cst_true_rep)
-            cl_direct_rmse, cl_direct_mae = _point_errors(np.array(cl_direct_pred), cl_ref)
-            cl_recon_rmse, cl_recon_mae = _point_errors(np.array(cl_recon), cl_ref)
+            cl_direct_arr = np.array(cl_direct_pred, dtype=np.float64)
+            cl_recon_arr = np.array(cl_recon, dtype=np.float64)
+            cl_delta = cl_recon_arr - cl_ref
+            cl_direct_rmse, cl_direct_mae = _point_errors(cl_direct_arr, cl_ref)
+            cl_recon_rmse, cl_recon_mae = _point_errors(cl_recon_arr, cl_ref)
             cd_recon_rmse, cd_recon_mae = _point_errors(np.array(cd_recon), cd_ref)
+            mean_cl_delta_signed = float(np.nanmean(cl_delta))
+            max_abs_cl_delta = float(np.nanmax(np.abs(cl_delta)))
+            rms_cl_delta = float(np.sqrt(np.nanmean(np.square(cl_delta))))
 
             # Geometry pointwise error against reference geometry using mean reconstructed geometry.
             xy_pred_mean = np.mean(np.stack(xy_pred_all, axis=0), axis=0)
@@ -442,6 +506,9 @@ def main() -> None:
                 "cl_direct_mae": cl_direct_mae,
                 "cl_recon_rmse": cl_recon_rmse,
                 "cl_recon_mae": cl_recon_mae,
+                "mean_cl_delta_signed": mean_cl_delta_signed,
+                "rms_cl_delta": rms_cl_delta,
+                "max_abs_cl_delta": max_abs_cl_delta,
                 "cd_recon_rmse": cd_recon_rmse,
                 "cd_recon_mae": cd_recon_mae,
                 "geometry_xy_rmse": geom_rmse,
@@ -474,23 +541,24 @@ def main() -> None:
                         "airfoil": airfoil_name,
                         "geometry_xy_mae": round(geom_mae, 6),
                         "cl_recon_rmse": round(cl_recon_rmse, 6),
+                        "mean_cl_delta_signed": round(mean_cl_delta_signed, 6),
+                        "max_abs_cl_delta": round(max_abs_cl_delta, 6),
                         "cd_recon_rmse": round(cd_recon_rmse, 6),
                     }
                 )
             )
 
     with out_json.open("w", encoding="utf-8") as f:
-        json.dump(
+        payload = _json_sanitize(
             {
                 "all_models": bool(args.all_models),
                 "num_models": len(checkpoints),
                 "device": str(device),
                 "neuralfoil_model_size": args.neuralfoil_model_size,
                 "rows": rows,
-            },
-            f,
-            indent=2,
+            }
         )
+        json.dump(payload, f, indent=2, allow_nan=False)
     if rows:
         headers = [
             "model",
@@ -501,6 +569,9 @@ def main() -> None:
             "cl_direct_mae",
             "cl_recon_rmse",
             "cl_recon_mae",
+            "mean_cl_delta_signed",
+            "rms_cl_delta",
+            "max_abs_cl_delta",
             "cd_recon_rmse",
             "cd_recon_mae",
             "geometry_xy_rmse",
@@ -541,6 +612,12 @@ def main() -> None:
         rows,
         metric_key="geometry_xy_mae",
         title="Geometry MAE across models and airfoils",
+    )
+    _plot_metric_heatmap(
+        fig_dir / f"{safe_tag}_heatmap_max_abs_cl_delta.png",
+        rows,
+        metric_key="max_abs_cl_delta",
+        title="max |CL_recon - CL_ref| across models and airfoils",
     )
     _plot_model_mean_rankings(fig_dir / f"{safe_tag}_model_ranking.png", rows)
     print(f"Saved paper study summary JSON: {out_json}")
