@@ -1,4 +1,4 @@
-"""SelfFoil core."""
+"""SelfFoil core — polar tokens → low-frequency Fourier coefficients."""
 
 from .airfoil_embedding import (
     MAX_ABS_FREQ,
@@ -7,24 +7,25 @@ from .airfoil_embedding import (
     N_FOURIER_REAL,
     AirfoilFourierEmbedding,
 )
-from .coord_fourier_regression import CoordFourierRegressionMLP, CoordToFourierMLP
+from .constants import POLAR_ALPHA, POLAR_CD, POLAR_CL, POLAR_DIM, POLAR_MA, POLAR_RE
 from .geometry import remove_duplicate_closure, resample_closed_poly
 from .polar_token_embedding import PolarTokenEmbedding
-from .regime_transformer import (
-    RegimeConditionedAeroTransformer,
-    fourier_mse_loss,
-)
+from .polar_voting_moe import PolarVotingMoETransformer, fourier_mse_loss
 
 __all__ = [
     "AirfoilFourierEmbedding",
-    "CoordFourierRegressionMLP",
-    "CoordToFourierMLP",
     "MAX_ABS_FREQ",
     "N_COMPLEX_MODES",
     "N_COORDS",
     "N_FOURIER_REAL",
+    "POLAR_ALPHA",
+    "POLAR_CD",
+    "POLAR_CL",
+    "POLAR_DIM",
+    "POLAR_MA",
+    "POLAR_RE",
     "PolarTokenEmbedding",
-    "RegimeConditionedAeroTransformer",
+    "PolarVotingMoETransformer",
     "fourier_mse_loss",
     "remove_duplicate_closure",
     "resample_closed_poly",

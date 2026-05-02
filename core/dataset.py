@@ -7,7 +7,6 @@ import io
 import json
 from collections.abc import Callable
 from pathlib import Path
-from typing import Iterator
 
 import numpy as np
 import torch
@@ -133,56 +132,3 @@ def make_polar_collate_fn(
         }
 
     return polar_collate_fn
-
-
-class CoordFourierSupervisedDataset(Dataset):
-    """
-    Optional coordinate→Fourier supervision: raw ``coords (250,2)`` rows and FFT targets ``(50,)``.
-
-    For the polar ``5 → 16`` token map, see :class:`~core.polar_token_embedding.PolarTokenEmbedding`
-    (trained inside the main polar Transformer, not here).
-    """
-
-    def __init__(
-        self,
-        csv_path: str | Path,
-        *,
-        max_rows: int | None = None,
-        fourier_engine: AirfoilFourierEmbedding | None = None,
-    ) -> None:
-        self.csv_path = Path(csv_path)
-        self.fourier = fourier_engine or AirfoilFourierEmbedding()
-        self._header_str, self._offsets = build_line_index(self.csv_path, max_rows)
-
-    def __len__(self) -> int:
-        return len(self._offsets)
-
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        row = read_row_by_index(self.csv_path, self._header_str, self._offsets, idx)
-        coords = np.asarray(json.loads(row["coords"]), dtype=np.float32)
-        return {"coords": torch.from_numpy(coords)}
-
-
-def make_coord_fourier_collate_fn(
-    fourier: AirfoilFourierEmbedding,
-) -> Callable[[list[dict[str, torch.Tensor]]], dict[str, torch.Tensor]]:
-    def _collate(
-        items: list[dict[str, torch.Tensor]],
-    ) -> dict[str, torch.Tensor]:
-        c = torch.stack([it["coords"] for it in items], dim=0)
-        tgt = torch.as_tensor(
-            fourier.encode_batch(c.numpy().astype(np.float64), resample=True),
-            dtype=torch.float32,
-        )
-        return {"coords": c, "target_fourier": tgt}
-
-    return _collate
-
-
-def iter_csv_rows(path: str | Path, *, max_rows: int | None = None) -> Iterator[dict[str, str]]:
-    with Path(path).open(newline="") as f:
-        reader = csv.DictReader(f)
-        for i, row in enumerate(reader):
-            if max_rows is not None and i >= max_rows:
-                break
-            yield row
