@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -18,10 +19,12 @@ from core.polar_voting_moe import PolarVotingMoETransformer, fourier_mse_loss
 
 
 @torch.inference_mode()
-def evaluate(model: PolarVotingMoETransformer, loader: DataLoader, dev: torch.device) -> float:
+def evaluate(
+    model: PolarVotingMoETransformer, loader: DataLoader, dev: torch.device, *, desc: str = "val"
+) -> float:
     model.eval()
     total, seen = 0.0, 0
-    for batch in loader:
+    for batch in tqdm(loader, desc=desc, leave=False, unit="batch"):
         polar = batch["polar"].to(dev)
         m = batch["padding_mask"].to(dev)
         tgt = batch["target_fourier"].to(dev)
@@ -74,15 +77,27 @@ def main() -> None:
         num_workers=args.num_workers,
     )
 
+    tqdm.write(
+        f"train rows={len(tr_ds)}  val rows={len(va_ds)}  batches/train={len(tr_load)}  "
+        f"device={dev}"
+    )
+
     model = PolarVotingMoETransformer().to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     best = float("inf")
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(1, args.epochs + 1):
+    epoch_bar = tqdm(range(1, args.epochs + 1), desc="epochs", unit="epoch")
+    for epoch in epoch_bar:
         model.train()
         run, n = 0.0, 0
-        for batch in tr_load:
+        batch_bar = tqdm(
+            tr_load,
+            desc=f"train e{epoch}/{args.epochs}",
+            leave=False,
+            unit="batch",
+        )
+        for batch in batch_bar:
             polar = batch["polar"].to(dev)
             m = batch["padding_mask"].to(dev)
             tgt = batch["target_fourier"].to(dev)
@@ -92,11 +107,15 @@ def main() -> None:
             loss = fourier_mse_loss(y, tgt)
             loss.backward()
             opt.step()
-            run += loss.item() * polar.size(0)
+            li = loss.item()
+            run += li * polar.size(0)
             n += polar.size(0)
+            batch_bar.set_postfix(loss=f"{li:.4e}", avg=f"{run / max(n, 1):.4e}")
+
         tr_mse = run / max(n, 1)
-        val_mse = evaluate(model, va_load, dev)
-        print(f"epoch {epoch}  train MSE {tr_mse:.6e}  val MSE {val_mse:.6e}")
+        val_mse = evaluate(model, va_load, dev, desc=f"val e{epoch}/{args.epochs}")
+        epoch_bar.set_postfix(train_mse=f"{tr_mse:.4e}", val_mse=f"{val_mse:.4e}")
+        tqdm.write(f"epoch {epoch}/{args.epochs}  train MSE {tr_mse:.6e}  val MSE {val_mse:.6e}")
         if val_mse < best:
             best = val_mse
             torch.save(
@@ -107,6 +126,9 @@ def main() -> None:
                 },
                 args.out,
             )
+            tqdm.write(f"  → saved best val MSE {best:.6e} to {args.out}")
+
+    tqdm.write(f"done. best val MSE {best:.6e} → {args.out}")
 
 
 if __name__ == "__main__":
