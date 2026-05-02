@@ -322,6 +322,13 @@ def main() -> None:
     p.add_argument("--stage-cycles", type=int, default=1, help="Number of geo<->aux cycles in two-stage mode")
     p.add_argument("--stage1-aux-scale", type=float, default=0.1, help="Aux scale used in geometry stage")
     p.add_argument("--stage2-aux-scale", type=float, default=1.0, help="Aux scale used in auxiliary stage")
+    p.add_argument(
+        "--struct32-input-noise",
+        type=float,
+        default=0.01,
+        dest="struct32_input_noise",
+        help="For --arch cst-struct32: train-only multiplicative noise x*(1+σ*ε), ε~N(0,1); 0 disables. Default 0.01 = 1%%.",
+    )
     args = p.parse_args()
     no_encoder_arch = args.arch in _NO_ENCODER_ARCHS
     loss_geom_only = no_encoder_arch or args.geo_only
@@ -389,6 +396,17 @@ def main() -> None:
         re_log = _fetch_batch(bundle_cpu, idx, "re_log_flat", device)
         mach = _fetch_batch(bundle_cpu, idx, "mach_flat", device)
         alpha = _fetch_batch(bundle_cpu, idx, "alpha_flat", device)
+        if (
+            args.arch == "cst-struct32"
+            and args.struct32_input_noise > 0.0
+            and model.training
+        ):
+            s = args.struct32_input_noise
+            cl = cl * (1.0 + s * torch.randn_like(cl))
+            cd = cd * (1.0 + s * torch.randn_like(cd))
+            re_log = re_log * (1.0 + s * torch.randn_like(re_log))
+            mach = mach * (1.0 + s * torch.randn_like(mach))
+            alpha = alpha * (1.0 + s * torch.randn_like(alpha))
         row = bundle_cpu["polar_row_idx"][idx]
         coords_gt = bundle_cpu["coords"][row].to(device, non_blocking=True)
 
@@ -431,6 +449,12 @@ def main() -> None:
         print(
             "Loss: decoded geometry (coord MAE/Huber) only — WHISP aux losses omitted; "
             "epoch lines show aux_scale=off (aux multiplier is not applied).",
+            flush=True,
+        )
+    if args.arch == "cst-struct32" and args.struct32_input_noise > 0.0:
+        print(
+            f"CstStruct32 train-only input noise: σ={args.struct32_input_noise:g} "
+            f"(x ← x·(1+σε)), validation uses clean inputs.",
             flush=True,
         )
     n_trainable = sum(x.numel() for x in model_base.parameters() if x.requires_grad)
@@ -705,6 +729,7 @@ def main() -> None:
     elif args.arch == "cst-struct32":
         meta = {
             "arch": "cst_struct32",
+            "struct32_input_noise": float(args.struct32_input_noise),
             "csv": str(args.csv.resolve()),
             "tau_start": args.tau_start,
             "tau_end": args.tau_end,
