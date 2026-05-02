@@ -4,7 +4,7 @@ from .cst_kulfan import CSTDecoder18, CSTEncoder18, fit_cst18_from_xy, fit_cst18
 from .linear_pair_autoencoder import PairLinearAutoencoder
 from .pair_encoder_loaders import pretrained_pair_embedders
 from .pair_tanh_autoencoder import PairTanhAutoencoder
-from .whisp_net import CstHandcrafted7, CstMLP, WHISP
+from .whisp_net import CstMLP, CstStruct32, WHISP
 from .whisp_physics import DeltaTransformer, PreDeltaPhysics
 
 __all__ = [
@@ -19,7 +19,7 @@ __all__ = [
     "fit_cst18_from_xy",
     "fit_cst18_from_xy_batched",
     "pretrained_pair_embedders",
-    "CstHandcrafted7",
+    "CstStruct32",
     "CstMLP",
     "WHISP",
     "PreDeltaPhysics",

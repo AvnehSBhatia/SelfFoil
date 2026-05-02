@@ -34,7 +34,7 @@ if str(ROOT) not in sys.path:
 from ablation_suite.models.whisp_ablated import WHISPAblated
 from core.cst_kulfan import CSTDecoder18, fit_cst18_from_xy_batched
 from core.figures_path import figures_dir
-from core.whisp_net import CstHandcrafted7, CstMLP
+from core.whisp_net import CstMLP, CstStruct32
 
 
 def _default_checkpoint() -> Path:
@@ -101,7 +101,7 @@ def _build_x_coords(n_points_per_side: int, device: torch.device) -> torch.Tenso
 
 
 def _load_inverse_checkpoint(ckpt_path: Path, device: torch.device) -> tuple[torch.nn.Module, str]:
-    """Load WHISPAblated or small CST heads (``cst_mlp``, ``cst_handcrafted7``). Returns (model, display_id)."""
+    """Load WHISPAblated or small CST heads (``cst_mlp``, ``cst_struct32``). Returns (model, display_id)."""
     blob = torch.load(ckpt_path, map_location=device, weights_only=False)
     meta = blob["meta"]
     arch = str(meta.get("arch", "")).lower().replace("-", "_")
@@ -116,8 +116,8 @@ def _load_inverse_checkpoint(ckpt_path: Path, device: torch.device) -> tuple[tor
         except ValueError:
             model_id = cpath.name
         return model, model_id
-    if arch == "cst_handcrafted7":
-        model = CstHandcrafted7().to(device)
+    if arch == "cst_struct32":
+        model = CstStruct32().to(device)
         model.load_state_dict(blob["model"])
         model.eval()
         cpath = ckpt_path.resolve()

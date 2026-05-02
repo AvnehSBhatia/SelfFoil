@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Train inverse models (Cl, Cd, Re, Mach, alpha) -> CST18.
 
-WHISP uses frozen pair encoders plus auxiliary physics losses. ``--arch cst-mlp`` (wide MLP)
-and ``--arch cst-handcrafted7`` (7-scalar handcrafted map) train geometry-only CST heads without encoders.
+WHISP ``forward`` returns ``(cst_pred, aux)``. **aux** holds side tensors used for extra losses:
+pre-delta physics ``L_ns``, per-stage ``cl_gamma_*``, and the direct lift head ``cl_direct``.
+Those are **auxiliary** terms on top of the main decoded-geometry (**coord**) loss.
+
+``--arch cst-mlp`` / ``cst-struct32`` have no aux heads (empty dict): training uses geometry loss only.
+For full WHISP, pass ``--geo-only`` to drop aux losses and optimize decoded (x,y) MAE/Huber only.
 
 Geometry loss is MAE (or Huber) on flattened airfoil coordinates after analytic CST decode, not MAE on CST coefficients.
 """
@@ -30,12 +34,13 @@ from core.csv_tensor_cache import load_or_build_cache
 from core.cst_kulfan import build_analytic_cst_decoder, coord_geo_loss_from_cst
 from core.device import configure_cuda_training, resolve_device
 from core.figures_path import figures_dir
-from core.whisp_net import CstHandcrafted7, CstMLP, WHISP
+from core.whisp_net import CstMLP, CstStruct32, WHISP
 
-_GEOM_ONLY_ARCHS = frozenset({"cst-mlp", "cst-handcrafted7"})
+# Architectures with no pair encoders (always geometry-only loss).
+_NO_ENCODER_ARCHS = frozenset({"cst-mlp", "cst-struct32"})
 _DEFAULT_OUT_FOR_ARCH: dict[str, Path] = {
     "cst-mlp": ROOT / "models" / "cst_mlp.pt",
-    "cst-handcrafted7": ROOT / "models" / "cst_handcrafted7.pt",
+    "cst-struct32": ROOT / "models" / "cst_struct32.pt",
 }
 
 
@@ -233,8 +238,8 @@ def main() -> None:
     p.add_argument(
         "--arch",
         default="whisp",
-        choices=["whisp", "cst-mlp", "cst-handcrafted7"],
-        help="whisp: encoder stack + iterative core; cst-mlp / cst-handcrafted7: geometry-only CST heads",
+        choices=["whisp", "cst-mlp", "cst-struct32"],
+        help="whisp: encoder stack + iterative core; cst-mlp / cst-struct32: geometry-only CST heads",
     )
     p.add_argument("--csv", type=Path, default=ROOT / "data" / "original.csv")
     p.add_argument("--cache", type=Path, default=ROOT / "models" / "original_tensors.pt")
@@ -256,7 +261,7 @@ def main() -> None:
         "--out",
         type=Path,
         default=None,
-        help="Checkpoint path (default: models/whisp.pt or models/cst_{mlp,handcrafted7}.pt from --arch)",
+        help="Checkpoint path (default: models/whisp.pt or models/cst_{mlp,struct32}.pt from --arch)",
     )
     p.add_argument("--models-dir", type=Path, default=ROOT / "models", help="Directory with encoder_*.pt from train_autoencoders")
     p.add_argument("--enc-cl", type=Path, default=None)
@@ -308,16 +313,22 @@ def main() -> None:
     )
     p.add_argument("--aux-ema-beta", type=float, default=0.98, help="EMA beta for aux loss normalization")
     p.add_argument("--aux-norm-eps", type=float, default=1e-6, help="Epsilon for aux loss normalization")
+    p.add_argument(
+        "--geo-only",
+        action="store_true",
+        help="WHISP: optimize decoded (x,y) geometry loss only; ignore aux (L_ns, cl_gamma, cl_direct).",
+    )
     p.add_argument("--two-stage", action="store_true", help="Enable two-stage training with early-stop-driven stage switching")
     p.add_argument("--stage-cycles", type=int, default=1, help="Number of geo<->aux cycles in two-stage mode")
     p.add_argument("--stage1-aux-scale", type=float, default=0.1, help="Aux scale used in geometry stage")
     p.add_argument("--stage2-aux-scale", type=float, default=1.0, help="Aux scale used in auxiliary stage")
     args = p.parse_args()
-    is_geom_only = args.arch in _GEOM_ONLY_ARCHS
+    no_encoder_arch = args.arch in _NO_ENCODER_ARCHS
+    loss_geom_only = no_encoder_arch or args.geo_only
     if args.out is None:
         args.out = _DEFAULT_OUT_FOR_ARCH.get(args.arch, ROOT / "models" / "whisp.pt")
-    if is_geom_only and args.two_stage:
-        raise SystemExit("--two-stage is only supported with --arch whisp")
+    if args.two_stage and loss_geom_only:
+        raise SystemExit("--two-stage needs WHISP auxiliary losses; omit --geo-only or use --arch whisp without --geo-only")
 
     device = resolve_device(args.device)
     configure_cuda_training(device, deterministic=False)
@@ -327,7 +338,7 @@ def main() -> None:
     enc_re = args.enc_re or md / "encoder_re_alpha.pt"
     enc_mach = args.enc_mach or md / "encoder_mach_alpha.pt"
     encoder_ckpts = (enc_cl, enc_cd, enc_re, enc_mach)
-    if not is_geom_only:
+    if not no_encoder_arch:
         for path in encoder_ckpts:
             if not path.is_file():
                 raise SystemExit(
@@ -357,8 +368,8 @@ def main() -> None:
 
     if args.arch == "cst-mlp":
         model_base = CstMLP(dropout_p=args.dropout_start).to(device)
-    elif args.arch == "cst-handcrafted7":
-        model_base = CstHandcrafted7().to(device)
+    elif args.arch == "cst-struct32":
+        model_base = CstStruct32().to(device)
     else:
         model_base = WHISP(encoder_ckpts=encoder_ckpts, dropout_p=args.dropout_start).to(device)
     model = maybe_compile_model(model_base, device, enabled=args.compile, backend=args.compile_backend)
@@ -389,7 +400,7 @@ def main() -> None:
             loss=args.geo_loss,
             huber_delta=args.huber_delta,
         )
-        if is_geom_only:
+        if loss_geom_only:
             z = torch.zeros((), device=device, dtype=l_geo.dtype)
             parts = {"geo": l_geo, "ns": z, "clg": z, "cld": z}
             return l_geo, parts
@@ -412,10 +423,18 @@ def main() -> None:
         parts = {"geo": l_geo, "ns": l_ns, "clg": l_cl_g, "cld": l_cl_d}
         return loss, parts
 
-    arch_label = {"cst-mlp": "CstMLP", "cst-handcrafted7": "CstHandcrafted7"}.get(args.arch, "WHISP")
+    arch_label = {"cst-mlp": "CstMLP", "cst-struct32": "CstStruct32"}.get(args.arch, "WHISP")
+    if args.geo_only and args.arch == "whisp":
+        arch_label = "WHISP (geo-only)"
     print(f"Device={device} | arch={args.arch} | train polar={train_idx.numel()} val polar={val_idx.numel()} | rows={n_rows}")
+    if loss_geom_only:
+        print(
+            "Loss: decoded geometry (coord MAE/Huber) only — WHISP aux losses omitted; "
+            "epoch lines show aux_scale=off (aux multiplier is not applied).",
+            flush=True,
+        )
     n_trainable = sum(x.numel() for x in model_base.parameters() if x.requires_grad)
-    enc_note = "" if is_geom_only else " (pair encoders frozen)"
+    enc_note = "" if no_encoder_arch else " (pair encoders frozen)"
     print(f"{arch_label} trainable parameters: {n_trainable}{enc_note}")
     total_train_batches = train_batch_count(train_idx.numel(), args.batch, args.max_train_batches)
     total_val_batches = train_batch_count(val_idx.numel(), args.batch, args.max_val_batches)
@@ -423,9 +442,10 @@ def main() -> None:
         f"Batch={args.batch} | train_batches/epoch={total_train_batches} "
         f"val_batches/epoch={total_val_batches} | compile_backend={args.compile_backend if args.compile else 'off'}"
     )
+    ramp_prefix = f"Aux ramp epochs={args.aux_ramp_epochs} | " if not loss_geom_only else ""
     print(
-        f"Aux ramp epochs={args.aux_ramp_epochs} | early_stop monitor={args.early_stop_monitor} "
-        f"patience={args.early_stop_patience} mode={args.early_stop_mode}"
+        f"{ramp_prefix}"
+        f"early_stop monitor={args.early_stop_monitor} patience={args.early_stop_patience} mode={args.early_stop_mode}"
     )
     total_train_steps = max(1, total_train_batches * max(1, args.epochs))
     print(f"LR schedule={args.lr_schedule} | base_lr={args.lr:.3e}")
@@ -540,8 +560,9 @@ def main() -> None:
                 run_parts[k] = float(run_parts[k].item())
 
         phase_tag = f" stage={stage}" if args.two_stage else ""
+        aux_scale_display = "off" if loss_geom_only else f"{aux_scale:.2f}"
         print(
-            f"epoch {ep + 1}/{args.epochs}{phase_tag}  τ={tau:.3f} aux={aux_scale:.2f}  train_loss={run_loss:.5e}  "
+            f"epoch {ep + 1}/{args.epochs}{phase_tag}  τ={tau:.3f} aux_scale={aux_scale_display}  train_loss={run_loss:.5e}  "
             f"[geo={run_parts['geo']:.4e} ns={run_parts['ns']:.4e} clg={run_parts['clg']:.4e} cld={run_parts['cld']:.4e}]  "
             f"val_loss={v_loss:.5e} val_coord_mae={v_geo:.5e} lr={opt.param_groups[0]['lr']:.3e}"
         )
@@ -681,9 +702,9 @@ def main() -> None:
             "val_rows": val_rows.cpu(),
             "test_rows": test_rows.cpu(),
         }
-    elif args.arch == "cst-handcrafted7":
+    elif args.arch == "cst-struct32":
         meta = {
-            "arch": "cst_handcrafted7",
+            "arch": "cst_struct32",
             "csv": str(args.csv.resolve()),
             "tau_start": args.tau_start,
             "tau_end": args.tau_end,
@@ -696,6 +717,7 @@ def main() -> None:
         assert isinstance(whisp, WHISP)
         meta = {
             "arch": "whisp",
+            "loss_geom_only": bool(args.geo_only),
             "n_outer": whisp.n_outer,
             "n_inner": whisp.stages[0].n_inner,
             "d": whisp.d,

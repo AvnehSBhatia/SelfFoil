@@ -7,35 +7,34 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
 from .pair_encoder_loaders import pretrained_pair_embedders
 from .whisp_physics import DeltaTransformer, PreDeltaPhysics
 
 
-class CstHandcrafted7(nn.Module):
+class CstStruct32(nn.Module):
     """
-    7 trainable scalars: one ``a`` (input scale + output scale), six group scales for 18/3 column triplets.
+    32-parameter inverse head: uses **Cl, Cd, AoA, log10(Re)** only (``mach`` is ignored for API parity).
 
-    Pipeline: scale inputs by ``a``; per-coordinate nonlinearities (GELU, tanh, sigmoid, exp, log∘ReLU);
-    build (B,5,18) from x_raw ⊗ z (row-wise product, replicated across 18 columns); scale each triplet of
-    columns by its learned scalar; within each triplet apply tanh / ReLU / softmax along the 5 rows;
-    sum over rows → (B,18); tanh and scale by ``a`` for CST coefficients.
+    Outer product (2,) ⊗ (2,) → (2×2), three residual blocks with learned (2×2) matmul + scalar bias;
+    flatten → Linear(4→1); concat with flat → (5,); two learned (5,) gates; build (15,) then append three
+    “first-of-block” scalars → (18,); three shared residual tanh blocks (scalar scale + bias).
     """
 
-    _EXP_CLAMP: float = 20.0
-
-    def __init__(self, *, cst_dim: int = 18, log_eps: float = 1e-6) -> None:
+    def __init__(self, *, cst_dim: int = 18) -> None:
         super().__init__()
-        if cst_dim % 3 != 0:
-            raise ValueError("cst_dim must be divisible by 3 for triplet column blocks.")
-        self.cst_dim = cst_dim
-        self.n_groups = cst_dim // 3
-        if self.n_groups != 6:
-            raise ValueError("Expected cst_dim=18 (six groups of three columns).")
-        self.log_eps = log_eps
-        self.a = nn.Parameter(torch.tensor(1.0))
-        self.group_scale = nn.Parameter(torch.ones(self.n_groups))
+        if cst_dim != 18:
+            raise ValueError("CstStruct32 is fixed to CST18 outputs.")
+        # 3 × (4 matrix + 1 scalar bias) = 15
+        self.W = nn.Parameter(torch.stack([torch.eye(2) + 0.01 * torch.randn(2, 2) for _ in range(3)]))
+        self.b_block = nn.Parameter(torch.zeros(3))
+        # 4→1 projection (dot + bias) = 5
+        self.proj4 = nn.Linear(4, 1)
+        # two 5×1 dot gates = 10
+        self.w_gate1 = nn.Parameter(torch.randn(5) * 0.02)
+        self.w_gate2 = nn.Parameter(torch.randn(5) * 0.02)
+        # shared final residual (applied 3×) = 2
+        self.final_scale = nn.Parameter(torch.tensor(1.0))
+        self.final_bias = nn.Parameter(torch.tensor(0.0))
 
     def forward(
         self,
@@ -46,31 +45,26 @@ class CstHandcrafted7(nn.Module):
         alpha: torch.Tensor,
         route_tau: float = 1.0,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        del route_tau
-        x_raw = torch.stack([cl, cd, re_log, mach, alpha], dim=-1)
-        s = self.a * x_raw
-        z0 = F.gelu(s[..., 0])
-        z1 = torch.tanh(s[..., 1])
-        z2 = torch.sigmoid(s[..., 2])
-        z3 = torch.exp(torch.clamp(s[..., 3], max=self._EXP_CLAMP))
-        z4 = torch.log(F.relu(s[..., 4]) + self.log_eps)
-        z = torch.stack([z0, z1, z2, z3, z4], dim=-1)
-
-        # (B, 5, 18): raw_i * z_i replicated across columns
-        hz = (x_raw * z).unsqueeze(-1).expand(-1, -1, self.cst_dim)
-
-        out_cols: list[torch.Tensor] = []
-        for g in range(self.n_groups):
-            block = hz[:, :, 3 * g : 3 * g + 3] * self.group_scale[g]
-            c0 = torch.tanh(block[:, :, 0])
-            c1 = F.relu(block[:, :, 1])
-            c2 = torch.softmax(block[:, :, 2], dim=1)
-            out_cols.extend([c0, c1, c2])
-
-        h_done = torch.stack(out_cols, dim=-1)
-        summed = h_done.sum(dim=1)
-        cst = torch.tanh(summed) * self.a
-        return cst, {}
+        del mach, route_tau
+        v1 = torch.stack([cl, cd], dim=-1)
+        v2 = torch.stack([alpha, re_log], dim=-1)
+        # Rows = Cl, Cd; cols = AoA, Re_log — M[i,j] = v1[i] * v2[j]
+        m = v1.unsqueeze(-1) * v2.unsqueeze(-2)
+        for k in range(3):
+            step = torch.einsum("ij,bjk->bik", self.W[k], m)
+            step = step + self.b_block[k]
+            m = m + torch.tanh(step)
+        flat = m.reshape(m.shape[0], 4)
+        s = self.proj4(flat)
+        u = torch.cat([s, flat], dim=-1)
+        s0 = torch.tanh((u * self.w_gate1).sum(dim=-1, keepdim=True))
+        s1 = torch.tanh((u * self.w_gate2).sum(dim=-1, keepdim=True))
+        ext = torch.cat([u * s0, u * s1, u], dim=-1)
+        firsts = torch.stack([ext[:, 0], ext[:, 5], ext[:, 10]], dim=-1)
+        v = torch.cat([ext, firsts], dim=-1)
+        for _ in range(3):
+            v = v + torch.tanh(self.final_scale * v + self.final_bias)
+        return v, {}
 
 
 class CstMLP(nn.Module):
